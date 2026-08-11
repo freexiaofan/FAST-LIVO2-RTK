@@ -1,0 +1,54 @@
+flowchart TD
+    A[main 启动] --> B[LIVMapper 构造/参数读取]
+    B --> C[订阅与发布器初始化]
+    C --> D[run 主循环]
+    D --> E{sync_packages 成功?}
+    E -- 否 --> D
+    E -- 是 --> F[首帧处理 handleFirstFrame]
+    F --> G[IMU处理 processImu]
+    G --> G1[ImuProcess::Process2 预积分+去畸变]
+    G1 --> H[stateEstimationAndMapping 分支]
+
+    H --> I{lio_vio_flg}
+    I -- VIO --> V1[handleVIO]
+    I -- LIO/LO --> L1[handleLIO]
+
+    L1 --> L2[点云下采样 VoxelGrid]
+    L2 --> L3[Body->World 变换]
+    L3 --> L4{地图已初始化?}
+    L4 -- 否 --> L5[BuildVoxelMap 初始建图]
+    L4 -- 是 --> L6[直接状态估计]
+    L5 --> L6
+
+    L6 --> S1[VoxelMapManager::StateEstimation]
+    S1 --> S2[构建每点 body 协方差 calcBodyCov]
+    S2 --> S3[迭代EKF循环 max_iterations]
+    S3 --> S4[按当前状态重算点世界协方差]
+    S4 --> S5[BuildResidualListOMP 并行匹配]
+    S5 --> S6[build_single_residual 递归八叉树]
+    S6 --> S7[门限判定与似然选择]
+    S7 --> S8[构建 H / R_inv / residual]
+    S8 --> S9{rtk_good?}
+    S9 -- 是 --> S10[追加RTK 3维观测]
+    S9 -- 否 --> S11[跳过RTK]
+    S10 --> S12[加权正规方程求解]
+    S11 --> S12
+    S12 --> S13[状态更新与收敛判定]
+    S13 --> S14{收敛或迭代结束?}
+    S14 -- 否 --> S3
+    S14 -- 是 --> S15[更新后验协方差]
+
+    S15 --> L7[UpdateVoxelMap 地图增量更新]
+    L7 --> L8{map_sliding_en?}
+    L8 -- 是 --> L9[mapSliding 滑窗裁图]
+    L8 -- 否 --> L10[发布/记录]
+    L9 --> L10
+
+    L10 --> R1{rtk_en && rtk_ini?}
+    R1 -- 是 --> R2[handleRTK 独立KF位置更新]
+    R1 -- 否 --> D
+    R2 --> D
+
+    D --> P1[imu_prop_callback 定时器]
+    P1 --> P2[从 latest_ekf_state 高频IMU前向传播]
+    P2 --> P3[发布 /LIVO2/imu_propagate]
