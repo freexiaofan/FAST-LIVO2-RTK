@@ -1,367 +1,85 @@
 #include "optimization.h"
-
-#include <algorithm>
-#include <cerrno>
-#include <cstdlib>
-#include <cmath>
-#include <limits>
-#include <numeric>
-
-#include <sys/select.h>
-#include <unistd.h>
+#include <filesystem>
 
 namespace {
-struct VelocitySeries
+// 建目录（含父级）。所有输出路径写文件前都过一遍：
+// PCL 写不存在的目录会抛 pcl::IOException("Error during open!")，未捕获直接 terminate 整个节点；
+// ofstream 则是静默失败（TUM/vel 文本什么都不写，更难查）。
+bool ensureOutDir(const std::string &dir, const char *tag)
 {
-    std::vector<double> times;
-    std::vector<double> values;
-};
-
-std::string shellQuote(const std::string& value)
-{
-    std::string quoted = "'";
-    for (char c : value) {
-        if (c == '\'') {
-            quoted += "'\\''";
-        } else {
-            quoted += c;
-        }
-    }
-    quoted += "'";
-    return quoted;
-}
-
-void ensureDirectory(const std::string& path)
-{
-    if (path.empty()) {
-        return;
-    }
-    const std::string command = "mkdir -p " + shellQuote(path);
-    const int rc = std::system(command.c_str());
-    if (rc != 0) {
-        ROS_WARN("[optimization] failed to create output directory: %s", path.c_str());
-    }
-}
-
-bool interpolateLinear(const VelocitySeries& series, double t, double& value)
-{
-    if (series.times.size() < 2 || t < series.times.front() || t > series.times.back()) {
-        return false;
-    }
-
-    auto upper = std::upper_bound(series.times.begin(), series.times.end(), t);
-    if (upper == series.times.begin()) {
-        value = series.values.front();
-        return true;
-    }
-    if (upper == series.times.end()) {
-        value = series.values.back();
-        return true;
-    }
-
-    const size_t i = static_cast<size_t>(upper - series.times.begin());
-    const double t0 = series.times[i - 1];
-    const double t1 = series.times[i];
-    if (t1 <= t0) {
-        return false;
-    }
-
-    const double a = (t - t0) / (t1 - t0);
-    value = series.values[i - 1] * (1.0 - a) + series.values[i] * a;
+  if (dir.empty()) return false;
+  try
+  {
+    std::filesystem::create_directories(dir);
     return true;
-}
-
-bool waitForOptimizationTrigger(const std::atomic_bool& shutdown_requested)
-{
-    while (ros::ok() && !shutdown_requested.load(std::memory_order_relaxed)) {
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(STDIN_FILENO, &read_set);
-
-        timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
-
-        const int rc = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ROS_WARN("[Offline Optimization] stdin wait failed, optimization trigger disabled.");
-            return false;
-        }
-
-        if (rc == 0 || !FD_ISSET(STDIN_FILENO, &read_set)) {
-            continue;
-        }
-
-        char ch = '\0';
-        const ssize_t nread = read(STDIN_FILENO, &ch, 1);
-        if (nread <= 0) {
-            ROS_INFO("[Offline Optimization] stdin closed before optimization trigger.");
-            return false;
-        }
-        if (ch == '\n') {
-            return true;
-        }
-    }
-
+  }
+  catch (const std::exception &e)
+  {
+    ROS_WARN("[%s] create dir failed: %s (%s)", tag, dir.c_str(), e.what());
     return false;
+  }
 }
-
-void smoothVelocitySeries(VelocitySeries& series)
-{
-    if (series.values.size() < 5) {
-        return;
-    }
-
-    std::vector<double> smoothed(series.values.size(), 0.0);
-    for (size_t i = 0; i < series.values.size(); ++i) {
-        const size_t begin = (i < 2) ? 0 : i - 2;
-        const size_t end = std::min(series.values.size() - 1, i + 2);
-        double sum = 0.0;
-        for (size_t j = begin; j <= end; ++j) {
-            sum += series.values[j];
-        }
-        smoothed[i] = sum / static_cast<double>(end - begin + 1);
-    }
-    series.values.swap(smoothed);
-}
-
-bool normalizeVelocitySeries(VelocitySeries& series)
-{
-    if (series.values.size() < 20) {
-        return false;
-    }
-
-    const double mean = std::accumulate(series.values.begin(), series.values.end(), 0.0)
-                      / static_cast<double>(series.values.size());
-    double sq_sum = 0.0;
-    for (double v : series.values) {
-        const double d = v - mean;
-        sq_sum += d * d;
-    }
-
-    const double stddev = std::sqrt(sq_sum / static_cast<double>(series.values.size()));
-    if (!std::isfinite(stddev) || stddev < 0.05) {
-        return false;
-    }
-
-    for (double& v : series.values) {
-        v = (v - mean) / stddev;
-    }
-    return true;
-}
-
-VelocitySeries buildVelocitySeries(const std::vector<std::vector<double>>& data, double time_shift)
-{
-    VelocitySeries series;
-    if (data.size() < 3) {
-        return series;
-    }
-
-    constexpr int IDX_TIME = 0;
-    constexpr int IDX_X = 1;
-    constexpr int IDX_Y = 2;
-    constexpr int IDX_Z = 3;
-    constexpr double MIN_DT = 1e-3;
-    constexpr double MAX_DT = 2.0;
-    constexpr double MAX_SPEED = 100.0;
-
-    series.times.reserve(data.size() - 1);
-    series.values.reserve(data.size() - 1);
-
-    for (size_t i = 1; i < data.size(); ++i) {
-        if (data[i].size() < 4 || data[i - 1].size() < 4) {
-            continue;
-        }
-
-        const double t0 = data[i - 1][IDX_TIME];
-        const double t1 = data[i][IDX_TIME];
-        const double dt = t1 - t0;
-        if (!std::isfinite(dt) || dt < MIN_DT || dt > MAX_DT) {
-            continue;
-        }
-
-        const double dx = data[i][IDX_X] - data[i - 1][IDX_X];
-        const double dy = data[i][IDX_Y] - data[i - 1][IDX_Y];
-        const double dz = data[i][IDX_Z] - data[i - 1][IDX_Z];
-        const double speed = std::sqrt(dx * dx + dy * dy + dz * dz) / dt;
-        if (!std::isfinite(speed) || speed > MAX_SPEED) {
-            continue;
-        }
-
-        series.times.push_back(0.5 * (t0 + t1) + time_shift);
-        series.values.push_back(speed);
-    }
-
-    smoothVelocitySeries(series);
-    return series;
-}
-
-VelocitySeries buildVelocitySeriesFromSamples(const std::vector<std::vector<double>>& data, double time_shift)
-{
-    VelocitySeries series;
-    if (data.size() < 3) {
-        return series;
-    }
-
-    constexpr int IDX_TIME = 0;
-    constexpr int IDX_VX = 1;
-    constexpr int IDX_VY = 2;
-    constexpr int IDX_VZ = 3;
-    constexpr double MIN_DT = 1e-3;
-    constexpr double MAX_DT = 2.0;
-    constexpr double MAX_SPEED = 100.0;
-
-    series.times.reserve(data.size());
-    series.values.reserve(data.size());
-
-    double last_time = std::numeric_limits<double>::quiet_NaN();
-    for (const auto& sample : data) {
-        if (sample.size() < 4) {
-            continue;
-        }
-
-        const double t = sample[IDX_TIME];
-        if (!std::isfinite(t)) {
-            continue;
-        }
-        if (std::isfinite(last_time)) {
-            const double dt = t - last_time;
-            if (dt < MIN_DT || dt > MAX_DT) {
-                last_time = t;
-                continue;
-            }
-        }
-
-        const double vx = sample[IDX_VX];
-        const double vy = sample[IDX_VY];
-        const double vz = sample[IDX_VZ];
-        const double speed = std::sqrt(vx * vx + vy * vy + vz * vz);
-        if (!std::isfinite(speed) || speed > MAX_SPEED) {
-            last_time = t;
-            continue;
-        }
-
-        series.times.push_back(t + time_shift);
-        series.values.push_back(speed);
-        last_time = t;
-    }
-
-    smoothVelocitySeries(series);
-    return series;
-}
-
-double scoreVelocityOffset(const VelocitySeries& slam,
-                           const VelocitySeries& gps,
-                           double fine_offset,
-                           int& pair_count)
-{
-    double sum_sg = 0.0;
-    double sum_ss = 0.0;
-    double sum_gg = 0.0;
-    pair_count = 0;
-
-    for (size_t i = 0; i < slam.times.size(); ++i) {
-        double gps_value = 0.0;
-        if (!interpolateLinear(gps, slam.times[i] - fine_offset, gps_value)) {
-            continue;
-        }
-
-        const double slam_value = slam.values[i];
-        sum_sg += slam_value * gps_value;
-        sum_ss += slam_value * slam_value;
-        sum_gg += gps_value * gps_value;
-        ++pair_count;
-    }
-
-    if (pair_count < 30 || sum_ss <= 1e-12 || sum_gg <= 1e-12) {
-        return -std::numeric_limits<double>::infinity();
-    }
-
-    return sum_sg / std::sqrt(sum_ss * sum_gg);
-}
-
-void writeVelocityAlignmentCsv(const std::string& csv_path,
-                               const std::vector<std::vector<double>>& gps_position_data,
-                               const std::vector<std::vector<double>>& slam_position_data,
-                               const std::vector<std::vector<double>>& gps_velocity_data,
-                               const std::vector<std::vector<double>>& slam_velocity_data,
-                               const std::string& velocity_source,
-                               double coarse_time_offset,
-                               double applied_fine_offset)
-{
-    VelocitySeries slam_velocity;
-    VelocitySeries gps_velocity;
-    if (velocity_source == "direct_twist") {
-        slam_velocity = buildVelocitySeriesFromSamples(slam_velocity_data, 0.0);
-        gps_velocity = buildVelocitySeriesFromSamples(gps_velocity_data, coarse_time_offset);
-    } else {
-        slam_velocity = buildVelocitySeries(slam_position_data, 0.0);
-        gps_velocity = buildVelocitySeries(gps_position_data, coarse_time_offset);
-    }
-
-    std::ofstream csv_file(csv_path);
-    if (!csv_file.is_open()) {
-        return;
-    }
-
-    csv_file << std::fixed << std::setprecision(9);
-    csv_file << "time_sec,livo_speed_mps,rtk_speed_coarse_mps,rtk_speed_applied_mps\n";
-    for (size_t i = 0; i < slam_velocity.times.size(); ++i) {
-        const double t = slam_velocity.times[i];
-        double gps_speed_coarse = 0.0;
-        double gps_speed_applied = 0.0;
-        const bool has_coarse = interpolateLinear(gps_velocity, t, gps_speed_coarse);
-        const bool has_applied = interpolateLinear(gps_velocity, t - applied_fine_offset, gps_speed_applied);
-
-        csv_file << t << "," << slam_velocity.values[i] << ",";
-        if (has_coarse) {
-            csv_file << gps_speed_coarse;
-        }
-        csv_file << ",";
-        if (has_applied) {
-            csv_file << gps_speed_applied;
-        }
-        csv_file << "\n";
-    }
-}
-} // namespace
+}  // namespace
 
 optimization::optimization(ros::NodeHandle &nh)
 {
     nh.param<std::string>("laserMapping/outputfilepath", outputfilepath, "");
     debug_optdata_path_ = outputfilepath + "/debug/";
     opt_tum_output_path_ = outputfilepath + "/TUM/opt_trajectory_after.txt";
-    livo_tum_before_output_path_ = outputfilepath + "/TUM/livo_trajectory_before.txt";
-    rtk_tum_output_path_ = outputfilepath + "/TUM/rtk_trajectory_time_aligned.txt";
+    gps_tum_output_path_ = outputfilepath + "/TUM/opt_trajectory_before.txt";
     opt_vel_output_path_ = outputfilepath + "/vel/opt_vel.txt";
     gps_vel_output_path_ = outputfilepath + "/vel/gps_vel.txt";
     global_map_pcd_path_ = outputfilepath + "/global_pcd/";
     keyframe_scan_pcd_path_ = outputfilepath + "/scan_pcd/";
 
-    if (!outputfilepath.empty()) {
-        ensureDirectory(debug_optdata_path_);
-        ensureDirectory(debug_optdata_path_ + "pcd/");
-        ensureDirectory(outputfilepath + "/TUM/");
-        ensureDirectory(outputfilepath + "/vel/");
-        ensureDirectory(global_map_pcd_path_);
-        ensureDirectory(keyframe_scan_pcd_path_);
-    }
+    // 输出目录必须先建好（原来只有 debug/ 和 vel/ 是手工存在的，
+    // global_pcd/ 缺失导致 saveOptimizedGlobalMap 抛 pcl::IOException 把节点搞崩）
+    ensureOutDir(debug_optdata_path_,           "opt-out");
+    ensureOutDir(outputfilepath + "/TUM",       "opt-out");
+    ensureOutDir(outputfilepath + "/vel",       "opt-out");
+    ensureOutDir(global_map_pcd_path_,          "opt-out");
+    ensureOutDir(keyframe_scan_pcd_path_,       "opt-out");
 
     nh.param<string>("gps/gps_topic", gps_topic, "/ublox_driver/receiver_lla");
     nh.param<double>("gps/gps_time_offset", gps_offset, 0.0);
     nh.param<bool>("gps/gps_en", gps_en, false);
     nh.param<vector<double>>("gps/extrinsic_T", gps_extrinT, vector<double>());
 
+    // 批优化触发方式：默认等关键帧停止增长(bag 播完)后自动跑；
+    // 也可以随时 `rostopic pub /run_offline_opt std_msgs/Empty -1` 手动触发
+    nh.param<bool>("opt/auto_trigger_en", auto_trigger_en_, true);
+    nh.param<double>("opt/finish_timeout", finish_timeout_, 5.0);
+    nh.param<int>("opt/min_keyframes", min_keyframes_, 10);
+    // initialAlign 里刚体对齐用多长的轨迹（秒）：<=0 = 用全部关键帧
+    nh.param<double>("opt/align_window", align_window_, -1.0);
+    // RTK(GPS)因子按距离抽稀的间隔，米；<=0 表示每个关键帧都加
+    nh.param<double>("opt/rtk_factor_interval", rtk_factor_interval_, 10.0);
+    subRunOpt = nh.subscribe<std_msgs::Empty>("/run_offline_opt", 1, &optimization::runOptTrigger_cbk, this);
+    // pubGpsOdom 原来只声明没 advertise，两个 handler 里的 publish() 全是空转
+    // （Release 带 -DNDEBUG，roscpp 里那句 ROS_ASSERT 被编掉，只剩静默 return）。
+    // 用独立话题名，别和 LIVMapper 已占用的 /gps/odometry 撞。
+    pubGpsOdom = nh.advertise<nav_msgs::Odometry>("/opt/rtk_odometry", 2000);
+
     nh.param<bool>("opt/debug_mode", debug_mode, false);
     nh.param<double>("opt/rtk_cov", rtk_cov, 0.02);
     nh.param<double>("opt/livo2_RPY_cov", livo2_RPY_cov, 1e-4);
     nh.param<double>("opt/livo2_XYZ_cov", livo2_XYZ_cov, 1e-4);
 
+    // RTK 观测来源二选一，和 LIVMapper 用同一组参数：默认 GNSS PVT；
+    // odom_rtk_en=true 时离线批优化的 RTK 因子也改由 /localization/odom 提供，
+    // 否则 gpsQueue 一直是空的（initialAlign 只会打印 "empty buffers" 直接返回）。
+    nh.param<bool>("gps/odom_rtk_en", odom_rtk_en_, false);
+    nh.param<std::string>("gps/odom_rtk_topic", odom_rtk_topic_, "/localization/odom");
     // subGPS = nh.subscribe<sensor_msgs::NavSatFix>(gps_topic, 2000, &optimization::gpsHandler, this);
-    subGPS_pvt = nh.subscribe<gnss_comm::GnssPVTSolnMsg>(gps_topic, 2000, &optimization::gpsHandler, this);
+    if (odom_rtk_en_)
+    {
+        subOdomRtk = nh.subscribe<nav_msgs::Odometry>(odom_rtk_topic_, 2000, &optimization::odomRtkHandler, this);
+        ROS_INFO("[opt] use odometry topic as RTK source: %s", odom_rtk_topic_.c_str());
+    }
+    else
+    {
+        subGPS_pvt = nh.subscribe<gnss_comm::GnssPVTSolnMsg>(gps_topic, 2000, &optimization::gpsHandler, this);
+    }
 
     Eigen::Vector3d gps_lever_arm_; 
     gps_lever_arm_(0) = gps_extrinT[0]; 
@@ -374,41 +92,110 @@ optimization::optimization(ros::NodeHandle &nh)
     sync_ = std::make_unique<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(10), subOdom_, subCloud_);
     sync_->registerCallback(boost::bind(&optimization::syncedCallback, this, _1, _2));
 
-    keyFrames.clear();
+    laserCloudSurfLastDS.reset(new PointCloudXYZRGB());
+    cloudKeyPoses6D.reset(new pcl::PointCloud<PointTypePose>());
+
+    for (int i = 0; i < 6; ++i) {
+        transformTobeMapped[i] = 0;
+    }
 
     if(debug_mode)
     {
         loadData(debug_optdata_path_);
     }
-    last_keyframe_wall_time_ = ros::WallTime::now();
 
     ROS_INFO("Optimization mode: [OFFLINE]. Accumulating factors for batch optimization.");
     optimization_thread_ = std::thread(&optimization::offlineOptimizationTask, this);
 }
 
-optimization::~optimization() 
+optimization::~optimization()
 {
-    optimization_shutdown_requested_.store(true, std::memory_order_relaxed);
-    if (optimization_thread_.joinable()) {
-        optimization_thread_.join();
-    }
+    // offlineOptimizationTask 线程若仍 joinable（比如还阻塞在 std::cin.get()，或已提前返回但
+    // 未被 join），在 std::thread 析构时会触发 std::terminate()——进程退出(Ctrl-C)时就会又崩一次。
+    // 这里 detach 掉，保证退出干净。join 不合适：交互模式下线程可能一直阻塞在 std::cin.get()，
+    // join 会把退出流程挂死。
+    if (optimization_thread_.joinable())
+        optimization_thread_.detach();
 }
 
 //Optimize threads
-void optimization::offlineOptimizationTask() {
-    if (!waitForOptimizationTrigger(optimization_shutdown_requested_)) {
-        return;
-    }
+void optimization::runOptTrigger_cbk(const std_msgs::Empty::ConstPtr& /*msg*/)
+{
+    ROS_INFO("[Offline Optimization] 收到 /run_offline_opt 手动触发");
+    trigger_now_ = true;
+}
 
-    waitForKeyFrameIdle(3.0);
+// 等批优化的触发条件。
+// 原来这里是 std::cin.get()：roslaunch 下本节点没有交互式 stdin（终端被 rosbag play 占用），
+// 它会立刻以 EOF 返回，于是批优化在一条数据都没收到时就跑一遍空 buffer；后来加的空 buffer
+// 保护又让线程直接 return —— 两个一叠加，表现就是"优化线程根本没起来"。
+// 现在改成轮询等待：关键帧数攒够 min_keyframes 且连续 finish_timeout 秒不再增长（说明 bag
+// 播完/建图停了）就开跑，也接受 /run_offline_opt 手动触发。
+// 计时用墙上时间：若 use_sim_time=true，bag 播完后 /clock 就停了，ros::Time::now() 会冻住。
+bool optimization::waitForBatchTrigger()
+{
+    size_t last_size = 0;
+    ros::WallTime last_change = ros::WallTime::now();
+    ros::WallTime last_log = ros::WallTime::now();
+
+    while (ros::ok())
+    {
+        size_t cur_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            cur_size = cloudKeyPoses6D->size();
+        }
+        const ros::WallTime now = ros::WallTime::now();
+
+        if (cur_size != last_size) { last_size = cur_size; last_change = now; }
+
+        const double idle = (now - last_change).toSec();
+
+        if (trigger_now_)
+        {
+            if (cur_size == 0) {
+                ROS_WARN("[Offline Optimization] 手动触发但还没有任何关键帧，忽略");
+                trigger_now_ = false;
+            } else {
+                ROS_INFO("[Offline Optimization] 手动触发，keyframes=%zu，开始批优化", cur_size);
+                return true;
+            }
+        }
+
+        if (auto_trigger_en_ && cur_size >= (size_t)min_keyframes_ && idle >= finish_timeout_)
+        {
+            ROS_INFO("[Offline Optimization] keyframes=%zu 已连续 %.1fs 没有新增，判定建图结束，开始批优化",
+                     cur_size, idle);
+            return true;
+        }
+
+        if ((now - last_log).toSec() >= 10.0)
+        {
+            last_log = now;
+            ROS_INFO("[Offline Optimization] 等待触发中: keyframes=%zu, rtk=%zu, 空闲 %.1fs "
+                     "(auto_trigger=%d, min_keyframes=%d, finish_timeout=%.1fs; 或 rostopic pub /run_offline_opt std_msgs/Empty -1)",
+                     cur_size, gpsQueue.size(), idle, (int)auto_trigger_en_, min_keyframes_, finish_timeout_);
+        }
+
+        ros::WallDuration(0.5).sleep();
+    }
+    ROS_WARN("[Offline Optimization] 节点关闭，未执行批优化");
+    return false;
+}
+
+void optimization::offlineOptimizationTask() {
+    if (!waitForBatchTrigger()) return;
+
+    // 从这里开始不再接收新关键帧：批优化会遍历/改写 cloudKeyPoses6D、surfCloudKeyFrames 和
+    // initialEstimate，而 syncedCallback 在另一个线程往里 push，并发修改会直接崩。
     {
         std::lock_guard<std::mutex> lock(mutex);
-        accepting_keyframes_ = false;
+        optimizing_ = true;
     }
     std::cout << "[Offline Optimization] Starting batch optimization..." << std::endl;
     initialAlign();
     std::cout << "[Offline Optimization] Initial alignment done." << std::endl;
-    writeTumTrajectory(livo_tum_before_output_path_);
+    writeOptimizedTumTrajectory();
     saveOptimizedGlobalMap();
     std::cout << "[Offline Optimization] Initial global map and tum saved." << std::endl;
     
@@ -420,7 +207,7 @@ void optimization::offlineOptimizationTask() {
     params.setAbsoluteErrorTol(1e-9);
     
     buildBatchGraph();
-    gtsam::LevenbergMarquardtOptimizer optimizer(gtSAMgraph, initialEstimate);
+    gtsam::LevenbergMarquardtOptimizer optimizer(gtSAMgraph, initialEstimate, params);
     gtsam::Values result = optimizer.optimize();
     initialEstimate = result;
     std::cout << "[Offline Optimization] First optimization pass done." <<  std::endl;
@@ -430,7 +217,12 @@ void optimization::offlineOptimizationTask() {
 
     for (int i = 0; i < numPoses; ++i) {
         gtsam::Pose3 rtk_optimizedPose = initialEstimate.at<gtsam::Pose3>(i);
-        keyFrames[i].pose = rtk_optimizedPose;
+        cloudKeyPoses6D->points[i].x     = rtk_optimizedPose.translation().x();
+        cloudKeyPoses6D->points[i].y     = rtk_optimizedPose.translation().y();
+        cloudKeyPoses6D->points[i].z     = rtk_optimizedPose.translation().z();
+        cloudKeyPoses6D->points[i].roll  = rtk_optimizedPose.rotation().roll();
+        cloudKeyPoses6D->points[i].pitch = rtk_optimizedPose.rotation().pitch();
+        cloudKeyPoses6D->points[i].yaw   = rtk_optimizedPose.rotation().yaw();
     }
 
     writeOptimizedTumTrajectory();
@@ -441,7 +233,12 @@ void optimization::offlineOptimizationTask() {
     for (int i = 0; i < numPoses; ++i) {
         gtsam::Pose3 rtk_optimizedPose = initialEstimate.at<gtsam::Pose3>(i);
         gtsam::Pose3 imu_optimizedPose = rtk_optimizedPose.compose((T_imu_rtk).inverse());
-        keyFrames[i].pose = imu_optimizedPose;
+        cloudKeyPoses6D->points[i].x     = imu_optimizedPose.translation().x();
+        cloudKeyPoses6D->points[i].y     = imu_optimizedPose.translation().y();
+        cloudKeyPoses6D->points[i].z     = imu_optimizedPose.translation().z();
+        cloudKeyPoses6D->points[i].roll  = imu_optimizedPose.rotation().roll();
+        cloudKeyPoses6D->points[i].pitch = imu_optimizedPose.rotation().pitch();
+        cloudKeyPoses6D->points[i].yaw   = imu_optimizedPose.rotation().yaw();
     }
 
     std::cout << "[Offline Optimization] Saving maps and trajectories..." << std::endl;
@@ -452,58 +249,32 @@ void optimization::offlineOptimizationTask() {
     std::cout << "[Offline Optimization] Finished." << std::endl;
 }
 
-void optimization::waitForKeyFrameIdle(double idle_seconds)
-{
-    const ros::WallDuration idle_duration(idle_seconds);
-    size_t last_count = 0;
-    while (ros::ok()) {
-        size_t current_count = 0;
-        ros::WallTime last_keyframe_time;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            current_count = keyFrames.size();
-            last_keyframe_time = last_keyframe_wall_time_;
-        }
-
-        const ros::WallDuration idle_time = ros::WallTime::now() - last_keyframe_time;
-        if (current_count > 0 && idle_time >= idle_duration) {
-            ROS_INFO("[Offline Optimization] Keyframe buffer idle for %.2fs, frozen at %zu frames.",
-                     idle_time.toSec(), current_count);
-            return;
-        }
-
-        if (current_count != last_count) {
-            ROS_INFO("[Offline Optimization] Waiting for keyframe buffer to drain: %zu frames.", current_count);
-            last_count = current_count;
-        }
-        ros::WallDuration(0.5).sleep();
-    }
-}
-
-void optimization::saveKeyFrameAndFactor(const gtsam::Pose3& pose,
-                                         double time,
-                                         const Eigen::Vector3d& velocity,
-                                         const PointCloudXYZRGB::Ptr& cloud)
+void optimization::saveKeyFramesAndFactor()
 {
     std::lock_guard<std::mutex> lock(mutex);
-    if (!accepting_keyframes_) {
-        return;
-    }
+    // 批优化已经开始：不再往 buffer 里加东西，否则和优化线程并发修改同一批容器
+    if (optimizing_) return;
+    
+    // Store pose
+    PointTypePose thisPose6D;
+    gtsam::Pose3 currentPose = trans2gtsamPose(transformTobeMapped);
+    initialEstimate.insert(cloudKeyPoses6D->size(), currentPose);
 
-    const size_t keyframe_index = keyFrames.size();
-    initialEstimate.insert(keyframe_index, pose);
-
-    KeyFrame keyframe;
-    keyframe.time = time;
-    keyframe.pose = pose;
-    keyframe.velocity = velocity;
-    keyframe.cloud.reset(new PointCloudXYZRGB());
-    if (cloud) {
-        pcl::copyPointCloud(*cloud, *keyframe.cloud);
-    }
-
-    keyFrames.push_back(keyframe);
-    last_keyframe_wall_time_ = ros::WallTime::now();
+    thisPose6D.x = currentPose.translation().x();
+    thisPose6D.y = currentPose.translation().y();
+    thisPose6D.z = currentPose.translation().z();
+    thisPose6D.intensity = cloudKeyPoses6D->size();
+    thisPose6D.roll  = currentPose.rotation().roll();
+    thisPose6D.pitch = currentPose.rotation().pitch();
+    thisPose6D.yaw   = currentPose.rotation().yaw();
+    thisPose6D.time = timeLaserInfoCur;
+    cloudKeyPoses6D->push_back(thisPose6D);
+    
+    // Storage point cloud
+    PointCloudXYZRGB::Ptr thisSurfKeyFrame(new PointCloudXYZRGB());
+    pcl::copyPointCloud(*laserCloudSurfLastDS, *thisSurfKeyFrame);
+    surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+    
 }
 
 //DTW
@@ -511,11 +282,6 @@ double optimization::calculateDtwTimeOffset(
     const std::vector<std::vector<double>>& gpsdata,
     const std::vector<std::vector<double>>& slamdata)
 {
-    if (gpsdata.size() < 3 || slamdata.size() < 3) {
-        ROS_WARN("[initialAlign] not enough samples for DTW time offset.");
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-
     const double MIN_EFFECTIVE_VELOCITY = 0.5; // m/s
     const int IDX_TIME = 0;
     const int IDX_X = 1;
@@ -573,13 +339,8 @@ double optimization::calculateDtwTimeOffset(
     auto [gps_pos_times, gps_pos_norms] = process_data(gpsdata);
     auto [slam_pos_times, slam_pos_norms] = process_data(slamdata);
 
-    if (gps_pos_norms.empty() || slam_pos_norms.empty()) {
-        ROS_WARN("[initialAlign] no moving samples for DTW time offset.");
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-
-    sample1 = slam_pos_norms.data();
-    sample2 = gps_pos_norms.data();
+    sample1 = &(slam_pos_norms[0]);
+    sample2 = &(gps_pos_norms[0]);
 
     std::vector<std::pair<int, int>> dtw_path;
     DTW(slam_pos_norms, gps_pos_norms, dtw_path);
@@ -595,7 +356,7 @@ double optimization::calculateDtwTimeOffset(
     }
 
     if (valid_pairs == 0) {
-        return std::numeric_limits<double>::quiet_NaN();
+        return 0.0;
     }
 
     double avg_time_diff = total_time_diff / valid_pairs;
@@ -624,225 +385,43 @@ double optimization::calculateDtwTimeOffset(
     return avg_time_diff;
 }
 
-double optimization::estimateVelocityTimeOffset(
-    const std::vector<std::vector<double>>& gps_position_data,
-    const std::vector<std::vector<double>>& slam_position_data,
-    const std::vector<std::vector<double>>& gps_velocity_data,
-    const std::vector<std::vector<double>>& slam_velocity_data,
-    double coarse_time_offset,
-    double& best_score,
-    double& zero_score,
-    int& best_pair_count,
-    std::string& velocity_source)
-{
-    best_score = -std::numeric_limits<double>::infinity();
-    zero_score = -std::numeric_limits<double>::infinity();
-    best_pair_count = 0;
-    velocity_source = "none";
-
-    auto canNormalize = [](const VelocitySeries& slam, const VelocitySeries& gps) {
-        VelocitySeries slam_copy = slam;
-        VelocitySeries gps_copy = gps;
-        return normalizeVelocitySeries(slam_copy) && normalizeVelocitySeries(gps_copy);
-    };
-
-    VelocitySeries direct_slam_velocity = buildVelocitySeriesFromSamples(slam_velocity_data, 0.0);
-    VelocitySeries direct_gps_velocity = buildVelocitySeriesFromSamples(gps_velocity_data, coarse_time_offset);
-
-    VelocitySeries slam_velocity;
-    VelocitySeries gps_velocity;
-    if (canNormalize(direct_slam_velocity, direct_gps_velocity)) {
-        slam_velocity = direct_slam_velocity;
-        gps_velocity = direct_gps_velocity;
-        velocity_source = "direct_twist";
-    } else {
-        slam_velocity = buildVelocitySeries(slam_position_data, 0.0);
-        gps_velocity = buildVelocitySeries(gps_position_data, coarse_time_offset);
-        velocity_source = "position_difference";
-    }
-
-    std::ofstream slam_file(opt_vel_output_path_);
-    if (slam_file.is_open()) {
-        slam_file << std::fixed << std::setprecision(6);
-        for (size_t i = 0; i < slam_velocity.values.size(); ++i) {
-            slam_file << slam_velocity.times[i] << " " << slam_velocity.values[i] << std::endl;
-        }
-        slam_file.close();
-    }
-
-    std::ofstream gps_file(gps_vel_output_path_);
-    if (gps_file.is_open()) {
-        gps_file << std::fixed << std::setprecision(6);
-        for (size_t i = 0; i < gps_velocity.values.size(); ++i) {
-            gps_file << gps_velocity.times[i] << " " << gps_velocity.values[i] << std::endl;
-        }
-        gps_file.close();
-    }
-
-    if (!normalizeVelocitySeries(slam_velocity) || !normalizeVelocitySeries(gps_velocity)) {
-        ROS_WARN("[initialAlign] velocity time offset skipped: not enough speed variation.");
-        velocity_source = "unusable";
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-
-    constexpr double SEARCH_RANGE_SEC = 10.0;
-    constexpr double SEARCH_STEP_SEC = 0.05;
-
-    int zero_pair_count = 0;
-    zero_score = scoreVelocityOffset(slam_velocity, gps_velocity, 0.0, zero_pair_count);
-
-    std::ofstream score_file(debug_optdata_path_ + "time_alignment_score.csv");
-    if (score_file.is_open()) {
-        score_file << std::fixed << std::setprecision(9);
-        score_file << "fine_offset_sec,score,pairs\n";
-    }
-
-    double best_offset = 0.0;
-    for (int step = static_cast<int>(std::round(-SEARCH_RANGE_SEC / SEARCH_STEP_SEC));
-         step <= static_cast<int>(std::round(SEARCH_RANGE_SEC / SEARCH_STEP_SEC));
-         ++step) {
-        const double candidate_offset = static_cast<double>(step) * SEARCH_STEP_SEC;
-        int pair_count = 0;
-        const double score = scoreVelocityOffset(slam_velocity, gps_velocity, candidate_offset, pair_count);
-        if (score_file.is_open()) {
-            score_file << candidate_offset << ",";
-            if (std::isfinite(score)) {
-                score_file << score;
-            } else {
-                score_file << "nan";
-            }
-            score_file << "," << pair_count << "\n";
-        }
-        if (score > best_score) {
-            best_score = score;
-            best_offset = candidate_offset;
-            best_pair_count = pair_count;
-        }
-    }
-
-    if (!std::isfinite(best_score)) {
-        ROS_WARN("[initialAlign] velocity time offset skipped: no overlapping velocity samples.");
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-
-    return best_offset;
-}
-
 //Spacetime synchronization
 void optimization::initialAlign()
 {
+    //using DTW
+    // std::vector<std::vector<double>> slamdata;
+    // slamdata.reserve(cloudKeyPoses6D->size());
+    // for (const auto& p : cloudKeyPoses6D->points) {
+    //     slamdata.push_back({p.time, p.x, p.y, p.z});
+    // }
+    
+    // std::vector<std::vector<double>> gpsdata;
+    // gpsdata.reserve(gpsQueue.size());
+    // for (const auto& g : gpsQueue) {
+    //     gpsdata.push_back({
+    //         g.header.stamp.toSec(),
+    //         g.pose.pose.position.x,
+    //         g.pose.pose.position.y,
+    //         g.pose.pose.position.z
+    //     });
+    // }
+
+    // double avg_time_diff = calculateDtwTimeOffset(gpsdata, slamdata);
+    
+    // ros::Duration time_offset(avg_time_diff);
+
+    // for(auto& g : gpsQueue) {
+    //     g.header.stamp += time_offset;
+    // }
+ 
+    // ROS_INFO("[initialAlign] 1. DTW calculated time offset: %.4f seconds.", avg_time_diff);
+
     //using spline
     std::cout << " [initialAlign] initial align (using Spline)... " << std::endl;
-    gpsQueue_B.clear();
 
-    if (keyFrames.empty() || gpsQueue.empty()) {
+    if (cloudKeyPoses6D->empty() || gpsQueue.empty()) {
         ROS_WARN("[initialAlign] empty buffers.");
         return;
-    }
-
-    std::vector<std::vector<double>> slam_position_data;
-    std::vector<std::vector<double>> slam_velocity_data;
-    slam_position_data.reserve(keyFrames.size());
-    slam_velocity_data.reserve(keyFrames.size());
-    for (const auto& keyframe : keyFrames) {
-        const auto& p = keyframe.pose.translation();
-        slam_position_data.push_back({keyframe.time, p.x(), p.y(), p.z()});
-        slam_velocity_data.push_back({
-            keyframe.time,
-            keyframe.velocity.x(),
-            keyframe.velocity.y(),
-            keyframe.velocity.z()});
-    }
-
-    std::vector<std::vector<double>> gps_position_data;
-    std::vector<std::vector<double>> gps_velocity_data;
-    gps_position_data.reserve(gpsQueue.size());
-    gps_velocity_data.reserve(gpsQueue.size());
-    for (const auto& g : gpsQueue) {
-        const auto& p = g.pose.pose.position;
-        const auto& v = g.twist.twist.linear;
-        gps_position_data.push_back({g.header.stamp.toSec(), p.x, p.y, p.z});
-        gps_velocity_data.push_back({g.header.stamp.toSec(), v.x, v.y, v.z});
-    }
-
-    const double slam_start = slam_position_data.front()[0];
-    const double slam_end = slam_position_data.back()[0];
-    const double gps_start = gps_position_data.front()[0];
-    const double gps_end = gps_position_data.back()[0];
-    const double raw_overlap = std::min(slam_end, gps_end) - std::max(slam_start, gps_start);
-    const bool epoch_mismatch = raw_overlap < 5.0
-                             || std::fabs(slam_start - gps_start) > 100.0
-                             || std::fabs(slam_end - gps_end) > 100.0;
-
-    const double coarse_time_offset = epoch_mismatch ? (slam_start - gps_start) : 0.0;
-    double best_velocity_score = -std::numeric_limits<double>::infinity();
-    double zero_velocity_score = -std::numeric_limits<double>::infinity();
-    int best_velocity_pairs = 0;
-    std::string velocity_source;
-    const double fine_time_offset = estimateVelocityTimeOffset(
-        gps_position_data, slam_position_data,
-        gps_velocity_data, slam_velocity_data,
-        coarse_time_offset, best_velocity_score, zero_velocity_score,
-        best_velocity_pairs, velocity_source);
-
-    double applied_time_offset = coarse_time_offset;
-    bool fine_time_offset_used = false;
-    if (std::isfinite(fine_time_offset) && std::fabs(fine_time_offset) <= 10.0 &&
-        std::isfinite(best_velocity_score) && best_velocity_score > 0.25) {
-        const bool score_improved = !std::isfinite(zero_velocity_score) ||
-                                  (best_velocity_score - zero_velocity_score) > 0.05;
-        if (epoch_mismatch || score_improved) {
-            applied_time_offset += fine_time_offset;
-            fine_time_offset_used = true;
-        }
-    }
-
-    if (std::fabs(applied_time_offset) > 1e-9) {
-        const ros::Duration time_offset(applied_time_offset);
-        for (auto& g : gpsQueue) {
-            g.header.stamp += time_offset;
-        }
-    }
-
-    writeVelocityAlignmentCsv(debug_optdata_path_ + "time_alignment_velocity.csv",
-                              gps_position_data, slam_position_data,
-                              gps_velocity_data, slam_velocity_data,
-                              velocity_source, coarse_time_offset,
-                              fine_time_offset_used ? fine_time_offset : 0.0);
-
-    ROS_INFO("[initialAlign] time offset raw_overlap: %.6f, coarse: %.6f, velocity_fine: %.6f, applied: %.6f, source: %s, score: %.3f, zero_score: %.3f, pairs: %d",
-             raw_overlap, coarse_time_offset, fine_time_offset, applied_time_offset,
-             velocity_source.c_str(), best_velocity_score, zero_velocity_score, best_velocity_pairs);
-
-    std::ofstream time_offset_file(debug_optdata_path_ + "time_offset.txt");
-    if (time_offset_file.is_open()) {
-        time_offset_file << std::fixed << std::setprecision(9);
-        time_offset_file << "slam_start " << slam_start << "\n";
-        time_offset_file << "slam_end " << slam_end << "\n";
-        time_offset_file << "gps_start_before " << gps_start << "\n";
-        time_offset_file << "gps_end_before " << gps_end << "\n";
-        time_offset_file << "raw_overlap_sec " << raw_overlap << "\n";
-        time_offset_file << "epoch_mismatch " << (epoch_mismatch ? 1 : 0) << "\n";
-        time_offset_file << "coarse_time_offset_sec " << coarse_time_offset << "\n";
-        time_offset_file << "velocity_fine_time_offset_sec " << fine_time_offset << "\n";
-        time_offset_file << "velocity_fine_used " << (fine_time_offset_used ? 1 : 0) << "\n";
-        time_offset_file << "velocity_source " << velocity_source << "\n";
-        time_offset_file << "velocity_best_score " << best_velocity_score << "\n";
-        time_offset_file << "velocity_zero_score " << zero_velocity_score << "\n";
-        time_offset_file << "velocity_best_pairs " << best_velocity_pairs << "\n";
-        time_offset_file << "applied_time_offset_sec " << applied_time_offset << "\n";
-        time_offset_file << "gps_start_after " << gpsQueue.front().header.stamp.toSec() << "\n";
-        time_offset_file << "gps_end_after " << gpsQueue.back().header.stamp.toSec() << "\n";
-        time_offset_file.close();
-    }
-
-    const std::string plot_script = std::string(ROOT_DIR) + "scripts/plot_time_alignment.py";
-    const std::string plot_command = "python3 " + shellQuote(plot_script) +
-                                     " --debug-dir " + shellQuote(debug_optdata_path_) +
-                                     " >/dev/null 2>&1";
-    const int plot_rc = std::system(plot_command.c_str());
-    if (plot_rc != 0) {
-        ROS_WARN("[initialAlign] failed to generate time alignment plot: %s", plot_script.c_str());
     }
     
     struct Sample { double t; Eigen::Vector3d p; };
@@ -980,9 +559,9 @@ void optimization::initialAlign()
     };
     
     //Aligning GPS queues and odometer spline
-    for (size_t i = 0; i < keyFrames.size(); ++i)
+    for (size_t i = 0; i < cloudKeyPoses6D->size(); ++i) 
     {
-        const double tk = keyFrames[i].time;
+        const double tk = cloudKeyPoses6D->points[i].time;
 
         nav_msgs::Odometry gps_odom_B;
         gps_odom_B.header.stamp = ros::Time().fromSec(tk);
@@ -1003,15 +582,21 @@ void optimization::initialAlign()
     std::vector<Eigen::Vector3d> A_slam_gps; 
     std::vector<Eigen::Vector3d> B_enu_gps;  
 
-    const double t_start = keyFrames.front().time;
-    const double t_end_svd = t_start + 50.0; 
+    // 对齐用多长的轨迹：opt/align_window <= 0 表示用全部关键帧（默认）。
+    // 原来固定只用前 50 s：一段近直线、近水平的轨迹对 6 自由度刚体 SVD 来说条件数很差，
+    // 俯仰/横滚几乎不可观测，SVD 会把 z 噪声拟成一个虚假倾角，误差再随行驶距离线性放大。
+    // 用全程数据（含转弯、坡度）几何构型丰富得多，拟合稳定；代价是 LIO 自身的漂移会被平摊
+    // 到整条轨迹（起点不再严格贴合）——对"给批优化提供初值"这个用途来说反而更合适。
+    const double t_start = cloudKeyPoses6D->points[0].time;
+    const bool use_all = (align_window_ <= 0.0);
+    const double t_end_svd = use_all ? 0.0 : (t_start + align_window_);
 
-    for (size_t i = 0; i < keyFrames.size(); ++i)
+    for (size_t i = 0; i < cloudKeyPoses6D->size(); ++i) 
     {
-        const auto& keyframe = keyFrames[i];
-        const double tk = keyframe.time;
+        const auto& slam_pose_imu = cloudKeyPoses6D->points[i];
+        const double tk = slam_pose_imu.time;
         
-        if (tk > t_end_svd) break; 
+        if (!use_all && tk > t_end_svd) break; 
         if (tk < T.front() || tk > T.back()) continue; 
 
         Eigen::Vector3d p_enu_gps;
@@ -1033,13 +618,52 @@ void optimization::initialAlign()
 
     gtsam::Pose3 T_enu_slam = computeSVD(B_enu_gps, A_slam_gps);
 
-    for (size_t i = 0; i < keyFrames.size(); ++i) {
+    // 对齐质量诊断：
+    //  - 点对数 / 轨迹里程（里程太短 → SVD 条件数差）
+    //  - T_enu_slam 的 rpy：LIVO 世界系就是初始 IMU 系（ImuProcess 里 rot_end 初始化成单位阵，
+    //    重力只存成向量、没把世界系转到重力对齐），所以 roll/pitch 理论上就等于开机瞬间 IMU
+    //    相对水平面的倾角，只有几度。明显更大就说明 SVD 拟出了虚假倾斜。
+    //  - 对齐残差 RMS/最大值：尺度或倾斜误差的特征是残差随行驶距离线性增长。
+    {
+        const Eigen::Vector3d rpy = T_enu_slam.rotation().rpy();
+        const gtsam::Point3   t   = T_enu_slam.translation();
+        double baseline = 0.0;
+        for (size_t k = 1; k < A_slam_gps.size(); ++k) baseline += (A_slam_gps[k] - A_slam_gps[k-1]).norm();
+
+        double sum_sq = 0.0, max_err = 0.0;
+        for (size_t k = 0; k < A_slam_gps.size(); ++k) {
+            const gtsam::Point3 pa(A_slam_gps[k]);
+            const double e = (B_enu_gps[k] - T_enu_slam.transformFrom(pa)).norm();
+            sum_sq += e * e;
+            if (e > max_err) max_err = e;
+        }
+        const double rms = std::sqrt(sum_sq / A_slam_gps.size());
+        const double R2D = 57.29577951308232;
+
+        ROS_INFO("[initialAlign] SVD 用了 %zu 个点对 (%s), 轨迹里程 %.1f m",
+                 A_slam_gps.size(), use_all ? "全部关键帧" : "前 align_window 秒", baseline);
+        ROS_INFO("[initialAlign] T_enu_slam: rpy=[%.3f, %.3f, %.3f] deg, t=[%.2f, %.2f, %.2f] m",
+                 rpy(0) * R2D, rpy(1) * R2D, rpy(2) * R2D, t.x(), t.y(), t.z());
+        ROS_INFO("[initialAlign] 对齐残差: RMS=%.3f m, max=%.3f m", rms, max_err);
+        if (std::fabs(rpy(0)) * R2D > 10.0 || std::fabs(rpy(1)) * R2D > 10.0)
+            ROS_WARN("[initialAlign] T_enu_slam 的 roll/pitch 偏大，可能是 SVD 在退化构型上拟出了虚假倾斜");
+    }
+
+    for (size_t i = 0; i < cloudKeyPoses6D->size(); ++i) {
         gtsam::Pose3 T_slam_imu = initialEstimate.at<gtsam::Pose3>(i);
         gtsam::Pose3 T_slam_gps = T_slam_imu.compose(T_imu_rtk);
         gtsam::Pose3 T_enu_gps = T_enu_slam.compose(T_slam_gps);
 
         initialEstimate.update(i, T_enu_gps);
-        keyFrames[i].pose = T_enu_gps;
+        
+        const auto& p = T_enu_gps.translation();
+        const auto& r = T_enu_gps.rotation().rpy();
+        cloudKeyPoses6D->points[i].x     = p.x();
+        cloudKeyPoses6D->points[i].y     = p.y();
+        cloudKeyPoses6D->points[i].z     = p.z();
+        cloudKeyPoses6D->points[i].roll  = r(0);
+        cloudKeyPoses6D->points[i].pitch = r(1);
+        cloudKeyPoses6D->points[i].yaw   = r(2);
     }
     
     ROS_INFO("[initialAlign] Spline-based alignment complete.");
@@ -1056,11 +680,21 @@ void optimization::buildBatchGraph()
     gtsam::noiseModel::Diagonal::shared_ptr priorNoise =
         gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6).finished());
     gtsam::noiseModel::Diagonal::shared_ptr odometryNoise = 
-        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << livo2_RPY_cov, livo2_RPY_cov, livo2_RPY_cov, livo2_XYZ_cov, livo2_XYZ_cov, livo2_XYZ_cov).finished());
+        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << livo2_RPY_cov, livo2_RPY_cov, livo2_RPY_cov, livo2_XYZ_cov, livo2_XYZ_cov, livo2_XYZ_cov*9).finished());
     gtsam::noiseModel::Diagonal::shared_ptr gps_noise =
-        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(3) << rtk_cov, rtk_cov, 1).finished());
+        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(3) << rtk_cov, rtk_cov, rtk_cov*4).finished());
 
     size_t rtk_idx = 0; 
+
+    ROS_INFO("[buildBatchGraph] initialEstimate.size()=%zu, gpsQueue_B.size()=%zu", initialEstimate.size(), gpsQueue_B.size());
+
+    // RTK 因子按空间距离抽稀：每走过 rtk_factor_interval_ 米才加一个（<=0 = 每个关键帧都加）。
+    // 关键帧是按时间产生的，等红灯/堵车时车不动但关键帧照样在攒，同一个位置会堆上几十个
+    // GPSFactor —— 等效于把那个点的权重放大几十倍，优化结果会被静止段拽偏。
+    // 按距离抽稀后，RTK 约束在空间上均匀分布。
+    bool has_last_gps = false;
+    gtsam::Point3 last_gps_point(0.0, 0.0, 0.0);
+    size_t n_gps_factor = 0;
 
     for (size_t i = 0; i < initialEstimate.size(); ++i)
     {
@@ -1079,6 +713,14 @@ void optimization::buildBatchGraph()
         }
 
         // addrtkfactor
+        // initialAlign 若提前返回（gpsQueue 空 / 样条建不起来），gpsQueue_B 会是空的或短于位姿数，
+        // 这里原来直接 gpsQueue_B[i] 是越界访问。缺 RTK 就只保留里程计因子，别崩。
+        if (i >= gpsQueue_B.size())
+        {
+            ROS_WARN_ONCE("[buildBatchGraph] gpsQueue_B(%zu) 短于位姿数(%zu)，缺失部分不加 RTK 因子",
+                          gpsQueue_B.size(), initialEstimate.size());
+            continue;
+        }
         auto it = gpsQueue_B[i];
         double x = it.pose.pose.position.x;
         double y = it.pose.pose.position.y;
@@ -1089,9 +731,25 @@ void optimization::buildBatchGraph()
         double cov_y = it.pose.covariance[7]; 
         double cov_z = it.pose.covariance[14]; 
 
-        gtSAMgraph.add(gtsam::GPSFactor(i, gps_point, gps_noise));
+        // 距上一个 RTK 因子不足 rtk_factor_interval_ 米就跳过（首个必加，作为绝对位置锚点）
+        if (has_last_gps && rtk_factor_interval_ > 0.0 &&
+            (gps_point - last_gps_point).norm() < rtk_factor_interval_)
+        {
+            continue;
+        }
+        last_gps_point = gps_point;
+        has_last_gps   = true;
 
+        gtSAMgraph.add(gtsam::GPSFactor(i, gps_point, gps_noise));
+        ++n_gps_factor;
     }
+
+    ROS_INFO("[buildBatchGraph] 位姿 %zu 个, RTK 因子 %zu 个 (间隔 %.1f m%s)",
+             initialEstimate.size(), n_gps_factor, rtk_factor_interval_,
+             rtk_factor_interval_ > 0.0 ? "" : " = 每帧都加");
+    if (n_gps_factor < 3)
+        ROS_WARN("[buildBatchGraph] RTK 因子只有 %zu 个，绝对约束太少，优化基本等于原样输出",
+                 n_gps_factor);
 } 
 
 void optimization::syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, const sensor_msgs::PointCloud2::ConstPtr& cloudMsg)
@@ -1104,19 +762,17 @@ void optimization::syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, c
     double roll, pitch, yaw;
     tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
 
-    gtsam::Pose3 pose(
-        gtsam::Rot3::RzRyRx(roll, pitch, yaw),
-        gtsam::Point3(odomMsg->pose.pose.position.x,
-                      odomMsg->pose.pose.position.y,
-                      odomMsg->pose.pose.position.z));
+    transformTobeMapped[0] = roll;
+    transformTobeMapped[1] = pitch;
+    transformTobeMapped[2] = yaw;
+    transformTobeMapped[3] = odomMsg->pose.pose.position.x;
+    transformTobeMapped[4] = odomMsg->pose.pose.position.y;
+    transformTobeMapped[5] = odomMsg->pose.pose.position.z;
+    
+    laserCloudSurfLastDS->clear();
+    pcl::fromROSMsg(*cloudMsg, *laserCloudSurfLastDS);
 
-    const auto& velocity_msg = odomMsg->twist.twist.linear;
-    Eigen::Vector3d velocity(velocity_msg.x, velocity_msg.y, velocity_msg.z);
-
-    PointCloudXYZRGB::Ptr cloud(new PointCloudXYZRGB());
-    pcl::fromROSMsg(*cloudMsg, *cloud);
-
-    saveKeyFrameAndFactor(pose, timeLaserInfoCur, velocity, cloud);
+    saveKeyFramesAndFactor();
 }
 
 void optimization::gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
@@ -1165,16 +821,66 @@ void optimization::gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
     gpsQueue.push_back(gps_odom);
 }
 
+// 与 LIVMapper::localization_odom_cbk 对应：把 /localization/odom 当 RTK 喂给离线批优化。
+// 位置同样减掉首帧当原点——和 LIVMapper 同进程、同话题、同一条首帧消息，两边原点一致。
+void optimization::odomRtkHandler(const nav_msgs::Odometry::ConstPtr& odomMsg)
+{
+    static int cnts = 0;
+    if (cnts++ % 10 != 0) {
+        return;
+    }
+
+    const Eigen::Vector3d p_abs(odomMsg->pose.pose.position.x,
+                                odomMsg->pose.pose.position.y,
+                                odomMsg->pose.pose.position.z);
+    if (!odom_rtk_first_) {
+        odom_rtk_first_ = true;
+        odom_rtk_origin_ = p_abs;
+        ROS_INFO("[opt][RTK(odom)] origin set to [%.3f, %.3f, %.3f]",
+                 odom_rtk_origin_[0], odom_rtk_origin_[1], odom_rtk_origin_[2]);
+    }
+    const Eigen::Vector3d trans_local_ = p_abs - odom_rtk_origin_;
+
+    gpstimestamp = odomMsg->header.stamp.toSec();
+
+    nav_msgs::Odometry gps_odom;
+    gps_odom.header.stamp = odomMsg->header.stamp - ros::Duration(gps_offset);
+    gps_odom.header.frame_id = "map";
+    gps_odom.pose.pose.position.x = trans_local_[0];
+    gps_odom.pose.pose.position.y = trans_local_[1];
+    gps_odom.pose.pose.position.z = trans_local_[2];
+    gps_odom.pose.pose.orientation.w = 1.0;   // 只用位置，姿态填单位四元数（否则 TUM 里是非法的 0,0,0,0）
+
+    // gps_odom.pose.pose.orientation = odomMsg->pose.pose.orientation;
+    // gps_odom.twist = odomMsg->twist;
+    // gps_odom.pose.covariance[0]  = 0.03 * 0.03;
+    // gps_odom.pose.covariance[7]  = 0.03 * 0.03;
+    // gps_odom.pose.covariance[14] = 0.06 * 0.06;
+
+    pubGpsOdom.publish(gps_odom);
+    gpsQueue.push_back(gps_odom);
+}
+
 void optimization::savekeyframescan()
 {
-    for (size_t i = 0; i < keyFrames.size(); ++i)
+    for (size_t i = 0; i < surfCloudKeyFrames.size(); ++i)
     {
         PointCloudXYZRGB::Ptr keyframe_cloud(new PointCloudXYZRGB());
-        *keyframe_cloud = *keyFrames[i].cloud;
-        Eigen::Affine3f transform = poseToAffine3f(keyFrames[i].pose);
+        *keyframe_cloud = *surfCloudKeyFrames[i];
+        Eigen::Affine3f transform = pclPointToAffine3f(cloudKeyPoses6D->points[i]);
         pcl::transformPointCloud(*keyframe_cloud, *keyframe_cloud, transform);
         std::string save_path = keyframe_scan_pcd_path_ + std::to_string(i) + ".pcd";
-        pcl::io::savePCDFileBinary(save_path, *keyframe_cloud);
+        if (keyframe_cloud->empty()) continue;
+        ensureOutDir(keyframe_scan_pcd_path_, "savekeyframescan");
+        try
+        {
+            pcl::io::savePCDFileBinary(save_path, *keyframe_cloud);
+        }
+        catch (const std::exception &e)
+        {
+            ROS_WARN("[savekeyframescan] write failed: %s (%s)", save_path.c_str(), e.what());
+            return;
+        }
     }
 }
 
@@ -1182,48 +888,65 @@ void optimization::saveOptimizedGlobalMap()
 {
     PointCloudXYZRGB::Ptr globalMapCloud(new PointCloudXYZRGB());
 
-    for (size_t i = 0; i < keyFrames.size(); ++i)
+    for (size_t i = 0; i < cloudKeyPoses6D->size(); ++i)
     {
-        Eigen::Affine3f transform = poseToAffine3f(keyFrames[i].pose);
-        PointCloudXYZRGB::Ptr original_cloud = keyFrames[i].cloud;
+        Eigen::Affine3f transform = pclPointToAffine3f(cloudKeyPoses6D->points[i]);
+        PointCloudXYZRGB::Ptr original_cloud = surfCloudKeyFrames[i];
         PointCloudXYZRGB::Ptr transformed_cloud(new PointCloudXYZRGB());
         pcl::transformPointCloud(*original_cloud, *transformed_cloud, transform);
         *globalMapCloud += *transformed_cloud;
     }
     
     std::string save_path;
-    if (is_optimized) 
+    if (is_optimized)
     {
         save_path = global_map_pcd_path_ + "after_optimization.pcd";
-    } 
+    }
     else
     {
         save_path = global_map_pcd_path_ + "before_optimization.pcd";
     }
-    pcl::io::savePCDFileBinary(save_path, *globalMapCloud);
+    // 防御：空点云直接跳过，避免 pcl::io::savePCDFileBinary 抛 pcl::IOException
+    // ("Input point cloud has no data!")——未捕获会 terminate 整个进程。
+    if (globalMapCloud->empty())
+    {
+        ROS_WARN("[saveOptimizedGlobalMap] global map cloud is empty, skip writing %s", save_path.c_str());
+        return;
+    }
+    // 目录不存在时 PCL 抛 pcl::IOException("Error during open!")，未捕获会 terminate 整个进程
+    ensureOutDir(global_map_pcd_path_, "saveOptimizedGlobalMap");
+    try
+    {
+        pcl::io::savePCDFileBinary(save_path, *globalMapCloud);
+        ROS_INFO("[saveOptimizedGlobalMap] saved %zu pts -> %s", globalMapCloud->size(), save_path.c_str());
+    }
+    catch (const std::exception &e)
+    {
+        ROS_WARN("[saveOptimizedGlobalMap] write failed: %s (%s)", save_path.c_str(), e.what());
+    }
 }
 
-void optimization::writeTumTrajectory(const std::string& path) {
-    if (keyFrames.empty()) {
+void optimization::writeOptimizedTumTrajectory() {
+    if (cloudKeyPoses6D->empty()) {
         ROS_WARN("No optimized keyframes to write to TUM file.");
         return;
     }
 
-    std::ofstream tum_file(path);
+    std::string final_path = opt_tum_output_path_;
+    std::ofstream tum_file(final_path);
+    if (!tum_file.is_open()) {
+        ROS_WARN("[writeOptimizedTumTrajectory] open failed: %s", final_path.c_str());
+        return;
+    }
     tum_file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
     tum_file << std::fixed << std::setprecision(6);
-    for (const auto& keyframe : keyFrames) {
-        const auto& t = keyframe.pose.translation();
-        const auto q = keyframe.pose.rotation().toQuaternion();
-        tum_file << keyframe.time << " "
-                 << t.x() << " " << t.y() << " " << t.z() << " "
+    for (const auto& pose : cloudKeyPoses6D->points) {
+        tf::Quaternion q = tf::createQuaternionFromRPY(pose.roll, pose.pitch, pose.yaw);
+        tum_file << pose.time << " "
+                 << pose.x << " " << pose.y << " " << pose.z << " "
                  << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
     }
     tum_file.close();
-}
-
-void optimization::writeOptimizedTumTrajectory() {
-    writeTumTrajectory(opt_tum_output_path_);
 }
 
 void optimization::writeRtkTumTrajectory() {
@@ -1232,7 +955,11 @@ void optimization::writeRtkTumTrajectory() {
         return;
     }
     
-    std::ofstream tum_file(rtk_tum_output_path_);
+    std::ofstream tum_file(gps_tum_output_path_);
+    if (!tum_file.is_open()) {
+        ROS_WARN("[writeRtkTumTrajectory] open failed: %s", gps_tum_output_path_.c_str());
+        return;
+    }
     tum_file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
     tum_file << std::fixed << std::setprecision(6);
 
@@ -1267,11 +994,8 @@ void optimization::loadData(const std::string& data_dir)
             if (line.empty() || line[0] == '#') continue;
 
             std::stringstream ss(line);
-            double t, x, y, z;
-            double vx = 0.0, vy = 0.0, vz = 0.0;
-            double h_acc = 0.0, v_acc = 0.0;
-            ss >> t >> x >> y >> z;
-            ss >> vx >> vy >> vz >> h_acc >> v_acc;
+            double t, x, y, z, vx, vy, vz, h_acc, v_acc;
+            ss >> t >> x >> y >> z ;
             
             nav_msgs::Odometry gps_msg;
             gps_msg.header.stamp = ros::Time().fromSec(t) - ros::Duration(gps_offset);
@@ -1281,12 +1005,6 @@ void optimization::loadData(const std::string& data_dir)
             gps_msg.pose.pose.position.y = y;
             gps_msg.pose.pose.position.z = z;
             gps_msg.pose.pose.orientation.w = 1.0;
-            gps_msg.twist.twist.linear.x = vx;
-            gps_msg.twist.twist.linear.y = vy;
-            gps_msg.twist.twist.linear.z = vz;
-            gps_msg.pose.covariance[0] = h_acc;
-            gps_msg.pose.covariance[7] = h_acc;
-            gps_msg.pose.covariance[14] = v_acc;
 
             gpsQueue.push_back(gps_msg);
             rtk_count++;
@@ -1300,7 +1018,7 @@ void optimization::loadData(const std::string& data_dir)
     // Load KeyFrames (Odom + PCD) 
     std::string odom_path = data_dir + "/odom.txt";
     std::string cov_path  = data_dir + "/cov.txt";
-    std::string pcd_dir   = data_dir + "/pcd/";
+    std::string pcd_dir   = data_dir + "pcd/";
 
     std::ifstream odom_file(odom_path);
     std::ifstream cov_file(cov_path);
@@ -1333,9 +1051,7 @@ void optimization::loadData(const std::string& data_dir)
 
         // Odom 
         double tx, ty, tz, qx, qy, qz, qw;
-        double vx = 0.0, vy = 0.0, vz = 0.0;
         ss_odom >> tx >> ty >> tz >> qx >> qy >> qz >> qw;
-        ss_odom >> vx >> vy >> vz;
 
         timeLaserInfoCur = t_odom;
         timeLaserInoStamp = ros::Time().fromSec(t_odom);
@@ -1343,23 +1059,26 @@ void optimization::loadData(const std::string& data_dir)
         tf::Quaternion orientation(qx, qy, qz, qw);
         double roll, pitch, yaw;
         tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
-        gtsam::Pose3 pose(
-            gtsam::Rot3::RzRyRx(roll, pitch, yaw),
-            gtsam::Point3(tx, ty, tz));
-        Eigen::Vector3d velocity(vx, vy, vz);
+        
+        transformTobeMapped[0] = roll;
+        transformTobeMapped[1] = pitch;
+        transformTobeMapped[2] = yaw;
+        transformTobeMapped[3] = tx;
+        transformTobeMapped[4] = ty;
+        transformTobeMapped[5] = tz;
 
         // PCD
         std::stringstream ss_filename;
         ss_filename << std::setw(6) << std::setfill('0') << processed_count;
         std::string pcd_path = pcd_dir + ss_filename.str() + ".pcd";
 
-        PointCloudXYZRGB::Ptr cloud(new PointCloudXYZRGB());
-        if (pcl::io::loadPCDFile(pcd_path, *cloud) == -1) {
+        laserCloudSurfLastDS->clear();
+        if (pcl::io::loadPCDFile(pcd_path, *laserCloudSurfLastDS) == -1) {
             ROS_ERROR("Missing PCD file for timestamp %.6f: %s", t_odom, pcd_path.c_str());
             continue; 
         }
 
-        saveKeyFrameAndFactor(pose, timeLaserInfoCur, velocity, cloud);
+        saveKeyFramesAndFactor();
         processed_count++;
     }
     

@@ -7,15 +7,15 @@ common:
   ros_driver_bug_fix: false
 
 extrin_calib:
-  extrinsic_T: [0.04165, 0.02326, -0.0284]
-  extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  # LidarToCamera 
-  # AGV-LVGO-02
-  Rcl: [ -0.002328, -0.999997,  0.000477,
-        -0.015224, -0.000441, -0.999884,
-        0.999881, -0.002335, -0.015223]
-  Pcl: [ -0.089164,  0.069986, -0.016360]
-  
+  # 内外参改为从标定文件夹直接读取，格式/目录结构同 Global-LVBA 的 keyframe 模式：
+  #   calib_path/intrinsics/<camera_frame>_Intrinsic.yaml
+  #   calib_path/extrinsics/{id}_{sensor}_2_{parent}_Extrinsics.yaml
+  calib_path: ""             # TODO: 填标定文件夹根路径（其下应有 intrinsics/ 和 extrinsics/ 两个子目录）
+  lidar_frame: "hesai128"    # 外参文件里 lidar 对应的传感器名
+  vehicle_frame: "vehicle"   # 外参文件里车体（=IMU）对应的坐标系名
+  camera_frame: "cam1"       # 相机名，同时用于内参文件名和外参文件里的传感器名
+  cam_scale: 1.0             # 内参按此系数缩放（对应原 camera.yaml 里的 scale）
+
 time_offset: 
   imu_time_offset: 0.0
   img_time_offset: 0.1
@@ -93,9 +93,28 @@ gps:
   gps_time_offset: 0.0
   extrinsic_T: [0, 0, 0]
   gps_topic: "/ublox_driver/receiver_pvt"
+  # 用 /localization/odom (nav_msgs/Odometry) 顶替 GNSS PVT 作为 RTK 观测
+  odom_rtk_en: false
+  odom_rtk_topic: "/localization/odom"
+  # RTK 位置观测的标准差 [x,y,z]，米。原来在 voxel_map.cpp 里硬编码成 [0.003,0.003,0.1]，
+  # 对实测残差（xy 十几厘米、z 数米）过于乐观：位置被钉死后激光残差只能靠旋转去消，姿态被带跑。
+  # z 给 1e3 = 实质关闭 z 观测（与 handleRTK 里 z_k[2]=state.z 的做法一致）。
+  rtk_std: [0.05, 0.05, 1000.0]
 
 opt:
   load_data: false
+  # 离线批优化的触发方式：关键帧数攒够 min_keyframes 且连续 finish_timeout 秒不再增长
+  # (即 bag 播完/建图停了) 就自动开跑；也可随时手动触发：
+  #   rostopic pub /run_offline_opt std_msgs/Empty -1
+  auto_trigger_en: true
+  finish_timeout: 5.0
+  min_keyframes: 10
+  # initialAlign 里 LIO->RTK 刚体对齐用多长的轨迹(秒)：<=0 = 用全部关键帧(推荐)。
+  # 原来写死 50s，短轨迹对 6 自由度 SVD 是退化构型，俯仰会被拟出虚假倾角。
+  align_window: -1.0
+  # RTK 因子按行驶距离抽稀的间隔(米)：每走 10 m 加一个 GPSFactor；<=0 = 每个关键帧都加。
+  # 关键帧按时间产生，等红灯时车不动也在攒帧，同一位置会堆几十个 RTK 因子把优化拽偏。
+  rtk_factor_interval: 10.0
   rtk_cov: 0.05
   livo2_RPY_cov: 0.00000001
   livo2_XYZ_cov: 0.0001

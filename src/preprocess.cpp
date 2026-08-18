@@ -724,6 +724,7 @@ void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
     const auto& pt = pl_orig.points[i];
     const double x = pt.x, y = pt.y, z = pt.z;
     const double dist_sqr = x * x + y * y + z * z;
+    if (dist_sqr > 80.0*80.0) continue;
     const bool is_valid = (dist_sqr >= blind_sqr) && !std::isnan(x) && !std::isnan(y) && !std::isnan(z);
     if (!is_valid) continue;
 

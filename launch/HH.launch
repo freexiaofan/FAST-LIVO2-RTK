@@ -2,21 +2,25 @@
 <!-- Launch file for Livox AVIA LiDAR -->
 
 	<arg name="rviz" default="true" />
-	<arg name="outputfilepath" default="$(find fast_livo)/output" />
 
 	<rosparam command="load" file="$(find fast_livo)/config/HH-LVGO.yaml" />
 
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
-		<rosparam file="$(find fast_livo)/config/camera_HH-LVGO-01.yaml" />
-		<param name="outputfilepath" value="$(arg outputfilepath)" />
-	
+		<!-- 相机内参改为从 extrin_calib/calib_path 指向的标定文件夹读取，不再加载 camera.yaml -->
+		<param name="outputfilepath" value="$(find fast_livo)/output" />
+
 	</node>
-	
+    	
 	<group if="$(arg rviz)">
 		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
 	</group>
 	
-	<node pkg="image_transport" type="republish" name="republish" args="compressed in:=/left_camera/image raw out:=/left_camera/image" output="screen" respawn="true"/>
+	<!-- republish 的 in:= 要填 base 话题名（它会自动补 /compressed 去订阅），不能写成 .../compressed，
+	     否则会去订 /front_pinhole_wide/compressed/compressed（不存在）导致收不到图像、/raw 永远不发布。 -->
+	<node pkg="image_transport" type="republish" name="republish" args="compressed in:=/front_pinhole_wide raw out:=/front_pinhole_wide/raw" output="screen" respawn="true"/>
+	<!-- <node pkg="rosbag" type="play" name="rosbag_play" args="$(find fast_livo)/test/0729.bag" output="log"/> -->
+	<node pkg="rosbag" type="play" name="rosbag_play" args="/home/tyjt/Desktop/ros_ws/src/FAST-LIVO2-RTK/test/0729.bag -d 3 -s 0 -r 0.5" output="log"/>
+
 
 launch-prefix="gdb -ex run --args"
 launch-prefix="valgrind --leak-check=full"

@@ -3,3 +3,7 @@ build/*
 devel/*
 PCD/*
 output/*
+Supplementary/
+test/
+rviz_cfg/
+thridparty/Sophus

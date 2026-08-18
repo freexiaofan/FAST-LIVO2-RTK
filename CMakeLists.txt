@@ -105,6 +105,7 @@ endif()
 find_package(GeographicLib REQUIRED)
 find_package(GTSAM REQUIRED QUIET)
 find_package(Boost REQUIRED COMPONENTS timer)
+find_package(yaml-cpp REQUIRED)   # 标定文件(内外参)解析，格式与 Global-LVBA 一致
 
 set(Sophus_LIBRARIES libSophus.so)
 
@@ -132,6 +133,7 @@ add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
+target_link_libraries(laser_mapping yaml-cpp)
 add_library(optimization src/optimization.cpp)
 
 # Add the main executable
@@ -156,6 +158,7 @@ target_link_libraries(fastlivo_mapping
   ${Boost_LIBRARIES}
   ${GeographicLib_LIBRARIES}
   gtsam
+  yaml-cpp
 )
 
 # Link mimalloc if found

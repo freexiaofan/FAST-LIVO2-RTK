@@ -1,29 +1,32 @@
 common:
-  img_topic: "/left_camera/image"
-  lid_topic: "/livox/lidar"
-  imu_topic: "/livox/imu"
+  img_topic: "/front_pinhole_wide/raw"
+  lid_topic: "/velodyne_points"
+  imu_topic: "/imu_pose"
+  # imu_topic: "/raw_imu"
   img_en: 1
   lidar_en: 1
   ros_driver_bug_fix: false
 
 extrin_calib:
-  extrinsic_T: [0.04165, 0.02326, -0.0284]
-  extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  # LidarToCamera 
-  Rcl: [ -0.010986, -0.999937,  0.002338,
-        -0.007770, -0.002253, -0.999967,
-        0.999909, -0.011004, -0.007745]
-  Pcl: [ -0.061281,  0.036577, -0.038252]
-  
+  # 内外参改为从标定文件夹直接读取，格式/目录结构同 Global-LVBA 的 keyframe 模式：
+  #   calib_path/intrinsics/<camera_frame>_Intrinsic.yaml
+  #   calib_path/extrinsics/{id}_{sensor}_2_{parent}_Extrinsics.yaml
+  calib_path: "/home/tyjt/Desktop/ros_ws/src/FAST-LIVO2-RTK/test/calibration/"             # TODO: 填标定文件夹根路径（其下应有 intrinsics/ 和 extrinsics/ 两个子目录）
+  lidar_frame: "front_lidar"    # 外参文件里 lidar 对应的传感器名
+  vehicle_frame: "vehicle"   # 车体系（本数据集 IMU≠vehicle，故 lidar->IMU 不用它）
+  imu_frame: "ins"           # IMU(ins) 坐标系名——lidar->IMU 外参查到这个系（关键：本车 ins 相对 vehicle 翻转 180°+抬高1.1m）
+  camera_frame: "frontpinholewide"       # 相机名，同时用于内参文件名和外参文件里的传感器名
+  cam_scale: 1.0             # 内参按此系数缩放（对应原 camera.yaml 里的 scale）
+
 time_offset: 
   imu_time_offset: 0.0
-  img_time_offset: 0.1
+  img_time_offset: 0.0
   exposure_time_init: 0.0
 
 preprocess:
-  point_filter_num: 1
+  point_filter_num: 2
   filter_size_surf: 0.1
-  lidar_type: 1 # Livox Avia LiDAR
+  lidar_type: 7 # Livox Avia LiDAR
   scan_line: 6
   blind: 0.8
 
@@ -42,8 +45,8 @@ vio:
 imu:
   imu_en: true
   imu_int_frame: 30
-  acc_cov: 0.05 # 0.2
-  gyr_cov: 0.03 #0.5
+  acc_cov: 0.2 # 0.2
+  gyr_cov: 0.5 #0.5
   b_acc_cov: 0.0001 # 0.1
   b_gyr_cov: 0.0001 # 0.1
   ba_bg_est_en: true
@@ -92,9 +95,40 @@ gps:
   gps_time_offset: 0.0
   extrinsic_T: [0, 0, 0]
   gps_topic: "/ublox_driver/receiver_pvt"
+  # 用 /localization/odom (nav_msgs/Odometry) 顶替 GNSS PVT 作为 RTK 观测
+  odom_rtk_en: true
+  odom_rtk_topic: "/localization/odom"
+  # RTK 位置观测的标准差 [x,y,z]，米。原来在 voxel_map.cpp 里硬编码成 [0.003,0.003,0.1]，
+  # 对实测残差（xy 十几厘米、z 数米）过于乐观：位置被钉死后激光残差只能靠旋转去消，姿态被带跑。
+  # z 给 1e3 = 实质关闭 z 观测（与 handleRTK 里 z_k[2]=state.z 的做法一致）。
+  rtk_std: [0.05, 0.05, 0.10]
 
 opt:
   load_data: false
-  rtk_cov: 0.01
-  livo2_RPY_cov: 0.00000001
-  livo2_XYZ_cov: 0.001
+  # 离线批优化的触发方式：关键帧数攒够 min_keyframes 且连续 finish_timeout 秒不再增长
+  # (即 bag 播完/建图停了) 就自动开跑；也可随时手动触发：
+  #   rostopic pub /run_offline_opt std_msgs/Empty -1
+  auto_trigger_en: true
+  finish_timeout: 5.0
+  min_keyframes: 10
+  # initialAlign 里 LIO->RTK 刚体对齐用多长的轨迹(秒)：<=0 = 用全部关键帧(推荐)。
+  # 原来写死 50s，短轨迹对 6 自由度 SVD 是退化构型，俯仰会被拟出虚假倾角。
+  align_window: -1.0
+  # RTK 因子按行驶距离抽稀的间隔(米)：每走 10 m 加一个 GPSFactor；<=0 = 每个关键帧都加。
+  # 关键帧按时间产生，等红灯时车不动也在攒帧，同一位置会堆几十个 RTK 因子把优化拽偏。
+  rtk_factor_interval: 5.0
+  rtk_cov: 0.05
+  livo2_RPY_cov: 0.00001
+  livo2_XYZ_cov: 0.02
+
+# 导出为 Global-LVBA 的 keyframe 数据集（供其做二次 LiDAR-Visual BA）
+# 输出目录结构（out_dir 下）：
+#   pointclouds/{idx}_{ts}.pcd        激光系点云
+#   odoms/{idx}_{ts}.yaml             IMU(ins)世界位姿 T_utm_ins
+#   images/<camera_frame>/{idx}_{ts}_<camera_frame>.jpg  去畸变全分辨率图
+#   calib/                            自动从 extrin_calib/calib_path 复制
+# Global-LVBA 侧对应设置：data_format=custom, mode=keyframe,
+#   camera_names=[frontpinholewide], lidar/vehicle/ins frame 与本文件一致
+lvba_export:
+  enable: true
+  out_dir: "/home/tyjt/Desktop/ros_ws/src/FAST-LIVO2-RTK/test/lvba_dataset"   # 输出根目录（留空则默认 outputfilepath/lvba_dataset）

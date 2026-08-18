@@ -27,7 +27,8 @@ using namespace Eigen;
 using namespace Sophus;
 
 #define print_line std::cout << __FILE__ << ", " << __LINE__ << std::endl;
-#define G_m_s2 (9.81)   // Gravaty const in GuangDong/China
+// #define G_m_s2 (9.81)   // Gravaty const in GuangDong/China
+#define G_m_s2 (9.788)   // Gravaty const in shanghai/China
 #define DIM_STATE (19)  // Dimension of states (Let Dim(SO(3)) = 3)
 #define INIT_COV (0.01)
 #define SIZE_LARGE (500)

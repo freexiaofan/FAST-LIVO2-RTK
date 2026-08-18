@@ -49,6 +49,12 @@ typedef struct VoxelMapConfig
   double sliding_thresh;
   bool map_sliding_en;
   int half_map_size;
+
+  // RTK 位置观测的标准差 [x, y, z]（米）。原来在 StateEstimation 里硬编码成
+  // [0.003, 0.003, 0.1]，对实测残差（xy 十几厘米、z 数米）来说过于乐观：
+  // 位置被钉死后激光残差只能靠旋转去消，姿态就被带跑了。
+  // 想彻底关掉某个轴就把对应 std 设成很大的值（如 1e3）。
+  std::vector<double> rtk_std_;
 } VoxelMapConfig;
 
 typedef struct PointToPlane

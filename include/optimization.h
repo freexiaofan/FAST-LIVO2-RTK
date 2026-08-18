@@ -25,36 +25,47 @@
 #include <gnss_comm/GnssPVTSolnMsg.h>
 
 #include <GeographicLib/LocalCartesian.hpp> 
-#include <Eigen/StdVector>
-#include <atomic>
+#include <std_msgs/Empty.h>
 #include <memory>
+#include <atomic>
 #include "LIVMapper.h"
 #include "FastDTW/example.hpp"
 
-struct KeyFrame
+struct PointXYZIRPYT
 {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    PCL_ADD_POINT4D;                  
+    PCL_ADD_INTENSITY;
+    float roll;
+    float pitch;
+    float yaw;
+    double time;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW   
+} EIGEN_ALIGN16;      
 
-    double time = 0.0;
-    gtsam::Pose3 pose = gtsam::Pose3::Identity();
-    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
-    PointCloudXYZRGB::Ptr cloud;
-};
+POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRPYT,
+                                   (float, x, x) (float, y, y)
+                                   (float, z, z) (float, intensity, intensity)
+                                   (float, roll, roll) (float, pitch, pitch) (float, yaw, yaw)
+                                   (double, time, time))
 
-using KeyFrameVector = std::vector<KeyFrame, Eigen::aligned_allocator<KeyFrame>>;
+typedef PointXYZIRPYT PointTypePose;
 
-inline Eigen::Affine3f poseToAffine3f(const gtsam::Pose3& pose)
+inline gtsam::Pose3 trans2gtsamPose(float transformIn[])
+{
+    return gtsam::Pose3(gtsam::Rot3::RzRyRx(transformIn[0], transformIn[1], transformIn[2]), 
+                        gtsam::Point3(transformIn[3], transformIn[4], transformIn[5]));
+}
+
+inline Eigen::Affine3f pclPointToAffine3f(PointTypePose thisPoint)
 { 
-    const auto& t = pose.translation();
-    const auto rpy = pose.rotation().rpy();
-    return pcl::getTransformation(t.x(), t.y(), t.z(), rpy.x(), rpy.y(), rpy.z());
+    return pcl::getTransformation(thisPoint.x, thisPoint.y, thisPoint.z, thisPoint.roll, thisPoint.pitch, thisPoint.yaw);
 }
 
 inline gtsam::Pose3 computeSVD(const std::vector<Eigen::Vector3d>& target, 
                                const std::vector<Eigen::Vector3d>& source)
 {
     if (target.empty() || target.size() != source.size()) {
-        return gtsam::Pose3::Identity(); 
+        return gtsam::Pose3::identity();
     }
 
     Eigen::Vector3d target_center = Eigen::Vector3d::Zero();
@@ -88,30 +99,22 @@ public:
 
     void loadData(const std::string& data_dir);
     void offlineOptimizationTask();
+    // 等待批优化的触发条件：关键帧攒够且不再增长(bag 播完)，或收到手动触发。
+    // 返回 false 表示节点要关了/永远等不到，调用方直接放弃。
+    bool waitForBatchTrigger();
+    void runOptTrigger_cbk(const std_msgs::Empty::ConstPtr& msg);
     void initialAlign();
     double calculateDtwTimeOffset(const std::vector<std::vector<double>>& gpsdata, const std::vector<std::vector<double>>& slamdata);
-    double estimateVelocityTimeOffset(const std::vector<std::vector<double>>& gps_position_data,
-                                      const std::vector<std::vector<double>>& slam_position_data,
-                                      const std::vector<std::vector<double>>& gps_velocity_data,
-                                      const std::vector<std::vector<double>>& slam_velocity_data,
-                                      double coarse_time_offset,
-                                      double& best_score,
-                                      double& zero_score,
-                                      int& best_pair_count,
-                                      std::string& velocity_source);
     void buildBatchGraph();
-    void waitForKeyFrameIdle(double idle_seconds);
-    void saveKeyFrameAndFactor(const gtsam::Pose3& pose,
-                               double time,
-                               const Eigen::Vector3d& velocity,
-                               const PointCloudXYZRGB::Ptr& cloud);
+    void saveKeyFramesAndFactor();
     void syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, const sensor_msgs::PointCloud2::ConstPtr& cloudMsg);
     void gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& pvtMsg);
+    // 用 /localization/odom (nav_msgs/Odometry) 顶替 GNSS PVT 喂 gpsQueue（离线批优化的 RTK 因子）
+    void odomRtkHandler(const nav_msgs::Odometry::ConstPtr& odomMsg);
     // void gpsHandler(const sensor_msgs::NavSatFixConstPtr& gpsMsg);
 
     void saveOptimizedGlobalMap();
     void savekeyframescan();
-    void writeTumTrajectory(const std::string& path);
     void writeOptimizedTumTrajectory();
     void writeRtkTumTrajectory();
     
@@ -128,6 +131,8 @@ public:
 public:
     ros::Subscriber subGPS;
     ros::Subscriber subGPS_pvt;
+    ros::Subscriber subOdomRtk;
+    ros::Subscriber subRunOpt;          // /run_offline_opt: 手动触发批优化
 
     ros::Publisher pubGpsOdom;
 
@@ -144,10 +149,13 @@ public:
     gtsam::Pose3 T_imu_rtk;
 
 
-    KeyFrameVector keyFrames;
+    PointCloudXYZRGB::Ptr laserCloudSurfLastDS;
+    vector<PointCloudXYZRGB::Ptr> surfCloudKeyFrames;
+    
+    pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D;
+    pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D;
 
     std::thread optimization_thread_;
-    std::atomic_bool optimization_shutdown_requested_{false};
 
     std::deque<nav_msgs::Odometry> gpsQueue;
     std::deque<nav_msgs::Odometry> gpsQueue_B;
@@ -157,6 +165,7 @@ public:
     double timeLaserInfoCur;
     ros::Time timeLaserInoStamp;
 
+    float transformTobeMapped[6];
     vector<double> gps_extrinT;
 
     double gps_offset;
@@ -166,20 +175,31 @@ public:
     double livo2_XYZ_cov;
        
 
+    // 批优化触发相关
+    std::atomic<bool> trigger_now_{false};   // 手动触发标志
+    bool optimizing_ = false;                // 批优化进行中：停止接收新关键帧，避免 buffer 被并发修改
+    bool auto_trigger_en_ = true;            // 关键帧停止增长后自动触发
+    double finish_timeout_ = 5.0;            // 多少秒没有新关键帧就认为建图结束(墙上时间)
+    int min_keyframes_ = 10;                 // 少于这么多关键帧不做批优化
+    double align_window_ = -1.0;             // initialAlign 刚体对齐用多长轨迹(秒)，<=0 = 全部
+    double rtk_factor_interval_ = 10.0;      // RTK 因子按距离抽稀的间隔(米)，<=0 = 每个关键帧都加
+
     bool debug_mode = false;
     bool addrtkfactor_ = false;
     bool save_pcd_enable_ = false;
     bool is_optimized = false;
     bool gps_en;
-    bool accepting_keyframes_ = true;
-    ros::WallTime last_keyframe_wall_time_;
 
     string gps_topic;
+    // RTK 观测来源换成 /localization/odom
+    bool odom_rtk_en_ = false;
+    string odom_rtk_topic_;
+    bool odom_rtk_first_ = false;
+    Eigen::Vector3d odom_rtk_origin_ = Eigen::Vector3d::Zero();
     string outputfilepath;
     string debug_optdata_path_;
     string opt_tum_output_path_;
-    string livo_tum_before_output_path_;
-    string rtk_tum_output_path_;
+    string gps_tum_output_path_;
     string opt_vel_output_path_;
     string gps_vel_output_path_;
     string global_map_pcd_path_;

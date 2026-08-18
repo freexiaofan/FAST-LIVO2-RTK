@@ -11,8 +11,10 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
-#include <gnss_comm/GnssPVTSolnMsg.h>     
+#include <gnss_comm/GnssPVTSolnMsg.h>
 #include <GeographicLib/LocalCartesian.hpp>
+#include <yaml-cpp/yaml.h>
+#include <filesystem>
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
       extR(M3D::Identity())
@@ -98,10 +100,17 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
   nh.param<bool>("pcd_save/colmap_output_en", colmap_output_en, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
-  nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
-  nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
-  nh.param<vector<double>>("extrin_calib/Pcl", cameraextrinT, vector<double>());
-  nh.param<vector<double>>("extrin_calib/Rcl", cameraextrinR, vector<double>());
+  // 内外参改为从标定文件夹直接读取（格式/目录结构同 Global-LVBA 的 keyframe 模式），
+  // 不再从 extrin_calib/extrinsic_T 等参数服务器上的固定数值读取。
+  nh.param<std::string>("extrin_calib/calib_path", calib_path_, "");
+  nh.param<std::string>("extrin_calib/lidar_frame", lidar_frame_, "hesai128");
+  nh.param<std::string>("extrin_calib/vehicle_frame", vehicle_frame_, "vehicle");
+  // IMU(ins) 坐标系名：lidar->IMU 外参必须查到 IMU 系，而不是 vehicle 系。
+  // 本数据集里 ins 相对 vehicle 有 180°翻转+1.1m 平移，若错用 vehicle 会让外参差一个 180°。
+  nh.param<std::string>("extrin_calib/imu_frame", imu_frame_, "ins");
+  nh.param<std::string>("extrin_calib/camera_frame", camera_frame_, "cam1");
+  nh.param<double>("extrin_calib/cam_scale", cam_scale_, 1.0);
+  nh.param<bool>("extrin_calib/undistort_image", undistort_en_, true);  // 图像入口整幅去畸变
   nh.param<double>("debug/plot_time", plot_time, -10);
   nh.param<int>("debug/frame_cnt", frame_cnt, 6);
 
@@ -114,8 +123,16 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   p_pre->blind_sqr = p_pre->blind * p_pre->blind;
 
   //nh.param<bool>("gps/gps_en", rtk_en, false);
+  // 用 /localization/odom 当 RTK 观测：odom_rtk_en=true 时不再订阅 GNSS PVT，
+  // 直接把该里程计的位置/速度塞进 rtk_buffer（rtk_en 随之打开，否则 sync_packages 不消费）
+  nh.param<bool>("gps/odom_rtk_en", odom_rtk_en_, false);
+  nh.param<std::string>("gps/odom_rtk_topic", odom_rtk_topic_, "/localization/odom");
+  if (odom_rtk_en_) rtk_en = true;
   nh.param<vector<double>>("gps/extrinsic_T", T_I_R, vector<double>());
   nh.param<std::string>("laserMapping/outputfilepath", save_directory, "");
+  // ==== 导出为 Global-LVBA keyframe 数据集（二次 LiDAR-Visual BA 用）====
+  nh.param<bool>("lvba_export/enable", save_lvba_en_, false);
+  nh.param<std::string>("lvba_export/out_dir", lvba_out_dir_, save_directory + "/lvba_dataset");
   pcd_save_file = save_directory + "/debug/pcd/";
   rtk_save_file = save_directory + "/debug/rtk.txt";
   imu_save_file = save_directory + "/debug/imu.txt";
@@ -123,16 +140,283 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   cov_save_file  = save_directory + "/debug/cov.txt"; 
 }
 
-void LIVMapper::initializeComponents() 
+// 从标定文件夹加载内参(相机)+外参(lidar->vehicle、cam->lidar)，替代原来从 ROS 参数服务器
+// 读固定数值/走 vk::camera_loader::loadFromRosNs 的方式。文件格式/目录结构与 Global-LVBA
+// 的 keyframe 模式（DatasetIO::loadIntrinsicsCustom/loadExtrinsicsCustom）保持一致：
+//   calib_path_/intrinsics/<camera_frame_>_Intrinsic.yaml   (cameraMatrix/distCoeffs/ImageWidth/ImageHeight)
+//   calib_path_/extrinsics/{id}_{sensor}_2_{parent}_Extrinsics.yaml (r_quaternion_wxyz + t_metric_xyz)
+bool LIVMapper::loadCalibrationFromFiles()
+{
+  namespace fs = std::filesystem;
+
+  const std::string intr_file = calib_path_ + "/intrinsics/" + camera_frame_ + "_Intrinsic.yaml";
+  if (!fs::exists(intr_file))
+  {
+    ROS_ERROR("[LIVMapper] intrinsics file not found: %s", intr_file.c_str());
+    return false;
+  }
+  double fx, fy, cx, cy;
+  int width, height;
+  std::vector<double> dist_coeffs;   // 读全部畸变系数（本相机是 8 参数 rational 模型）
+  try
+  {
+    YAML::Node r = YAML::LoadFile(intr_file);
+    auto K = r["cameraMatrix"]["data"];   // [fx 0 cx 0 fy cy 0 0 1]
+    auto D = r["distCoeffs"]["data"];     // [k1 k2 p1 p2 k3 (k4 k5 k6)]
+    fx = K[0].as<double>(); cx = K[2].as<double>();
+    fy = K[4].as<double>(); cy = K[5].as<double>();
+    for (std::size_t i = 0; i < D.size(); ++i) dist_coeffs.push_back(D[i].as<double>());
+    width  = r["ImageWidth"].as<int>();
+    height = r["ImageHeight"].as<int>();
+  }
+  catch (const std::exception &e)
+  {
+    ROS_ERROR("[LIVMapper] failed to parse intrinsics %s: %s", intr_file.c_str(), e.what());
+    return false;
+  }
+
+  // 是否真的有畸变（任一系数非零）
+  bool has_distortion = false;
+  for (double c : dist_coeffs) if (std::fabs(c) > 1e-12) { has_distortion = true; break; }
+
+  // 构建整幅去畸变映射（全分辨率、newK=K，保持内参不变；随后 VIO 内部再按 cam_scale resize）。
+  // 用完整 distCoeffs（8 参数 rational），cv::initUndistortRectifyMap 会自动按系数个数选模型。
+  undistort_ready_ = false;
+  if (undistort_en_ && has_distortion)
+  {
+    cv::Mat Kfull = (cv::Mat_<double>(3, 3) << fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0);
+    cv::Mat Dmat(1, static_cast<int>(dist_coeffs.size()), CV_64F);
+    for (int i = 0; i < (int)dist_coeffs.size(); ++i) Dmat.at<double>(0, i) = dist_coeffs[i];
+    cv::initUndistortRectifyMap(Kfull, Dmat, cv::Mat(), Kfull, cv::Size(width, height),
+                                CV_16SC2, undist_map1_, undist_map2_);
+    calib_img_width_  = width;
+    calib_img_height_ = height;
+    undistort_ready_  = true;
+  }
+
+  // 相机模型：整幅去畸变后图像已是 rectified，投影按纯针孔（零畸变），避免与 world2cam 重复加畸变。
+  // 若关闭了整幅去畸变(undistort_en_=false)则退回 vk 解析畸变(仅支持到 k3，rational 高阶项会被忽略)。
+  if (undistort_ready_)
+    vio_manager->cam = new vk::PinholeCamera(width, height, cam_scale_, fx, fy, cx, cy, 0, 0, 0, 0);
+  else
+  {
+    double k1 = dist_coeffs.size() > 0 ? dist_coeffs[0] : 0.0;
+    double k2 = dist_coeffs.size() > 1 ? dist_coeffs[1] : 0.0;
+    double p1 = dist_coeffs.size() > 2 ? dist_coeffs[2] : 0.0;
+    double p2 = dist_coeffs.size() > 3 ? dist_coeffs[3] : 0.0;
+    vio_manager->cam = new vk::PinholeCamera(width, height, cam_scale_, fx, fy, cx, cy, k1, k2, p1, p2);
+  }
+
+  {
+    std::string dstr;
+    for (double c : dist_coeffs) { char b[32]; std::snprintf(b, sizeof(b), "%.6g ", c); dstr += b; }
+    ROS_INFO("[LIVMapper] loaded intrinsics from %s: %dx%d(scale=%.3f) fx=%.3f fy=%.3f cx=%.3f cy=%.3f dist(%zu)=[%s]",
+             intr_file.c_str(), width, height, cam_scale_, fx, fy, cx, cy, dist_coeffs.size(), dstr.c_str());
+    if (undistort_ready_)
+      ROS_INFO("[LIVMapper] image UNDISTORT enabled: full-res remap %dx%d built (%zu dist coeffs); camera model set to PINHOLE(no distortion)",
+               width, height, dist_coeffs.size());
+    else if (undistort_en_ && !has_distortion)
+      ROS_WARN("[LIVMapper] undistort requested but all dist coeffs are zero -> skip (image treated as already rectified)");
+    else if (!undistort_en_)
+      ROS_WARN("[LIVMapper] image undistort DISABLED (extrin_calib/undistort_image=false) -> using vk analytic distortion (rational k4..k6 ignored!)");
+  }
+
+  const std::string ext_folder = calib_path_ + "/extrinsics";
+  if (!fs::is_directory(ext_folder))
+  {
+    ROS_ERROR("[LIVMapper] extrinsics folder not found: %s", ext_folder.c_str());
+    return false;
+  }
+  SensorExtrinsics ext;
+  ext.loadFolder(ext_folder);
+
+  // lidar->IMU 外参：必须查到 IMU(ins) 系。之前误用 vehicle 系，而本数据集 ins 相对 vehicle
+  // 有 180°翻转+1.1m，会让外参整体差一个 180° 翻转，导致点云相对 IMU 重力/运动翻转。
+  Eigen::Matrix4d T_imu_lidar, T_cam_lidar;
+  if (!ext.lookupTransform(imu_frame_, lidar_frame_, T_imu_lidar))
+  {
+    ROS_ERROR("[LIVMapper] lookup T_%s_%s failed (check filenames under %s)",
+               imu_frame_.c_str(), lidar_frame_.c_str(), ext_folder.c_str());
+    return false;
+  }
+  if (!ext.lookupTransform(camera_frame_, lidar_frame_, T_cam_lidar))
+  {
+    ROS_ERROR("[LIVMapper] lookup T_%s_%s failed (check filenames under %s)",
+               camera_frame_.c_str(), lidar_frame_.c_str(), ext_folder.c_str());
+    return false;
+  }
+
+  // T_imu_lidar = lidar->IMU 外参（喂给 setImuToLidarExtrinsic / p_imu）
+  extrinT = {T_imu_lidar(0, 3), T_imu_lidar(1, 3), T_imu_lidar(2, 3)};
+  extrinR = {T_imu_lidar(0, 0), T_imu_lidar(0, 1), T_imu_lidar(0, 2),
+             T_imu_lidar(1, 0), T_imu_lidar(1, 1), T_imu_lidar(1, 2),
+             T_imu_lidar(2, 0), T_imu_lidar(2, 1), T_imu_lidar(2, 2)};
+  // T_cam_lidar 就是 lidar->camera 外参 Rcl/Pcl
+  cameraextrinT = {T_cam_lidar(0, 3), T_cam_lidar(1, 3), T_cam_lidar(2, 3)};
+  cameraextrinR = {T_cam_lidar(0, 0), T_cam_lidar(0, 1), T_cam_lidar(0, 2),
+                   T_cam_lidar(1, 0), T_cam_lidar(1, 1), T_cam_lidar(1, 2),
+                   T_cam_lidar(2, 0), T_cam_lidar(2, 1), T_cam_lidar(2, 2)};
+
+  // 详细打印最终外参，方便肉眼确认对不对（旋转以欧拉角 deg 展示）
+  auto eulerDeg = [](const Eigen::Matrix4d &Tm) {
+    Eigen::Matrix3d R = Tm.block<3, 3>(0, 0);
+    double sy = std::sqrt(R(0, 0) * R(0, 0) + R(1, 0) * R(1, 0));
+    double roll  = std::atan2(R(2, 1), R(2, 2)) * 180.0 / M_PI;
+    double pitch = std::atan2(-R(2, 0), sy) * 180.0 / M_PI;
+    double yaw   = std::atan2(R(1, 0), R(0, 0)) * 180.0 / M_PI;
+    char buf[128]; std::snprintf(buf, sizeof(buf), "roll=%.2f pitch=%.2f yaw=%.2f", roll, pitch, yaw);
+    return std::string(buf);
+  };
+  ROS_INFO("[LIVMapper][extrinsic] lidar->IMU  (%s <- %s): t=[%.4f, %.4f, %.4f]  %s",
+           imu_frame_.c_str(), lidar_frame_.c_str(), extrinT[0], extrinT[1], extrinT[2],
+           eulerDeg(T_imu_lidar).c_str());
+  ROS_INFO("[LIVMapper][extrinsic] lidar->cam  (%s <- %s): t=[%.4f, %.4f, %.4f]  %s",
+           camera_frame_.c_str(), lidar_frame_.c_str(), cameraextrinT[0], cameraextrinT[1], cameraextrinT[2],
+           eulerDeg(T_cam_lidar).c_str());
+  ROS_WARN("[LIVMapper][extrinsic] 若 lidar->IMU 的 roll≈±180 属正常（本车 ins 相对 vehicle 翻转安装）；"
+           "若这里又变回 roll≈0，说明 imu_frame 配错（配成 vehicle 了）");
+  return true;
+}
+
+// ============================================================================
+// 导出为 Global-LVBA keyframe 数据集（DatasetIO::loadFramesKeyframe 读取）
+//   pointclouds/{idx}_{ts}.pcd  —— 激光系点云 (PointXYZI)
+//   odoms/{idx}_{ts}.yaml       —— T_utm_ins（= 本系统 IMU/ins 世界位姿 _state），
+//                                   position:[x y z] + pose:[3x3 行主序]
+//   images/<cam>/{idx}_{ts}_<cam>.jpg —— 去畸变全分辨率图像
+//   calib/                      —— 复制自 calib_path_（Global-LVBA 按纯针孔投影，忽略畸变系数）
+//
+// 几何自洽：Global-LVBA 用 world = T_utm_ins · T_ins_vehicle · T_vehicle_lidar · p_lidar，
+//   而 T_ins_vehicle·T_vehicle_lidar = T_ins_lidar = 本系统 extR/extT，T_utm_ins = _state，
+//   点云存激光系，故两边世界坐标完全一致（前提：Global-LVBA 用同一个 calib 文件夹）。
+// LIO 关键帧先写点云+odom(LIO 位姿)；同帧 VIO 再写图并用 VIO 位姿覆写 odom（更优）。
+// ============================================================================
+// 防御性建目录（失败不抛，交由后续写文件的 try/catch 兜底）
+static inline void ensureLvbaDir(const std::string &dir)
+{
+  try { std::filesystem::create_directories(dir); } catch (...) {}
+}
+
+// ts 传全精度时间戳：文件名里的 ts 已截成 3 位小数，这里在 yaml 内保留完整精度。
+// 注意 StatesGroup 无 timestamp 成员，故时间戳由调用方显式传入。
+bool LIVMapper::writeLvbaOdom(const std::string &stem, const StatesGroup &st, double ts)
+{
+  const std::string odom_dir  = lvba_out_dir_ + "/odoms";
+  const std::string odom_path = odom_dir + "/" + stem + ".yaml";
+  try
+  {
+    ensureLvbaDir(odom_dir);
+    std::ofstream f(odom_path);
+    if (!f.is_open())
+    {
+      ROS_WARN_THROTTLE(5.0, "[LVBA export] 打不开 odom: %s", odom_path.c_str());
+      return false;
+    }
+    const V3D &p = st.pos_end;
+    const M3D &R = st.rot_end;
+    f << std::fixed << std::setprecision(3);
+    f << "timestamp: [" << ts << "]\n";
+    f << std::fixed << std::setprecision(9);
+    f << "position: [" << p(0) << ", " << p(1) << ", " << p(2) << "]\n";
+    f << "pose: [";
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c)
+      {
+        f << R(r, c);
+        if (!(r == 2 && c == 2)) f << ", ";
+      }
+    f << "]\n";
+    return f.good();
+  }
+  catch (const std::exception &e)
+  {
+    ROS_WARN_THROTTLE(5.0, "[LVBA export] 写 odom 失败: %s (%s)", odom_path.c_str(), e.what());
+    return false;
+  }
+}
+
+void LIVMapper::saveLvbaKeyframeLidar()
+{
+  if (!save_lvba_en_) return;
+  if (feats_undistort == nullptr || feats_undistort->empty()) return;
+
+  // 候选序号 + 主干 {idx}_{ts}（ts 保留 3 位小数）——点云写成功后才提交序号/stem，
+  // 保证 idx 连续、不产生孤儿 odom/图像。pcd/odom/image 三者共用同一 stem 严格配对。
+  const int cand_idx = lvba_kf_index_ + 1;
+  char stem_buf[128];
+  snprintf(stem_buf, sizeof(stem_buf), "%d_%.3f", cand_idx, keyframe_time);
+  const std::string cand_stem(stem_buf);
+
+  // 1) 激光系去畸变点云 -> pointclouds/{stem}.pcd（转成 PointXYZI，Global-LVBA 读的类型）
+  pcl::PointCloud<pcl::PointXYZI> cloud_out;
+  cloud_out.reserve(feats_undistort->size());
+  for (const auto &pt : feats_undistort->points)
+  {
+    pcl::PointXYZI q;
+    q.x = pt.x; q.y = pt.y; q.z = pt.z; q.intensity = pt.intensity;
+    cloud_out.push_back(q);
+  }
+  const std::string pcd_dir  = lvba_out_dir_ + "/pointclouds";
+  const std::string pcd_path = pcd_dir + "/" + cand_stem + ".pcd";
+  try
+  {
+    ensureLvbaDir(pcd_dir);
+    // 注意：PCL 写失败会抛 pcl::IOException（不是返回码），必须 try/catch，否则整个节点 terminate
+    pcl::io::savePCDFileBinary(pcd_path, cloud_out);
+  }
+  catch (const std::exception &e)
+  {
+    ROS_WARN_THROTTLE(5.0, "[LVBA export] 存点云失败(跳过该帧): %s (%s)", pcd_path.c_str(), e.what());
+    return;  // 不提交序号/stem、不写 odom，避免孤儿文件
+  }
+
+  // 提交
+  lvba_kf_index_    = cand_idx;
+  lvba_cur_stem_    = cand_stem;
+  lvba_cur_kf_time_ = keyframe_time;
+
+  // 2) IMU/ins 世界位姿 -> odoms/{stem}.yaml（此处为 LIO 位姿；同帧 VIO 会用更优位姿覆写）
+  writeLvbaOdom(lvba_cur_stem_, _state, keyframe_time);
+}
+
+void LIVMapper::saveLvbaKeyframeImageOdom(const cv::Mat &img)
+{
+  if (!save_lvba_en_) return;
+  if (img.empty()) return;
+  // 只在“当前 VIO 帧 == 刚存过激光的关键帧”时才写，避免 LIO 早退/写失败时用陈旧 stem 配错图
+  if (lvba_kf_index_ < 0 || lvba_cur_stem_.empty()) return;
+  if (std::fabs(lvba_cur_kf_time_ - keyframe_time) > 1e-6) return;
+
+  // 用 VIO 更新后的更优位姿覆写 odom
+  writeLvbaOdom(lvba_cur_stem_, _state, keyframe_time);
+
+  // 去畸变全分辨率图 -> images/<cam>/{stem}_<cam>.jpg
+  const std::string img_dir  = lvba_out_dir_ + "/images/" + camera_frame_;
+  const std::string img_path = img_dir + "/" + lvba_cur_stem_ + "_" + camera_frame_ + ".jpg";
+  try
+  {
+    ensureLvbaDir(img_dir);
+    if (!cv::imwrite(img_path, img))  // 失败可能返回 false，也可能抛 cv::Exception
+      ROS_WARN_THROTTLE(5.0, "[LVBA export] 存图像失败: %s", img_path.c_str());
+  }
+  catch (const std::exception &e)
+  {
+    ROS_WARN_THROTTLE(5.0, "[LVBA export] 存图像异常: %s (%s)", img_path.c_str(), e.what());
+  }
+}
+
+void LIVMapper::initializeComponents()
 {
   downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+
+  if (!loadCalibrationFromFiles())
+    throw std::runtime_error("Failed to load calibration (intrinsics/extrinsics) from: " + calib_path_);
+
   extT << VEC_FROM_ARRAY(extrinT);
   extR << MAT_FROM_ARRAY(extrinR);
 
   voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
   voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
-
-  if (!vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam)) throw std::runtime_error("Camera model not correctly specified.");
 
   vio_manager->grid_size = grid_size;
   vio_manager->patch_size = patch_size;
@@ -171,6 +455,20 @@ void LIVMapper::initializeComponents()
 
 void LIVMapper::initializeFiles() 
 {
+  // debug 输出目录先建好：这些路径下用 PCL 写盘，目录不存在会抛 pcl::IOException 把节点搞崩
+  if (!save_directory.empty())
+  {
+    try
+    {
+      std::filesystem::create_directories(save_directory + "/debug/pcd");
+      std::filesystem::create_directories(save_directory + "/TUM");
+      std::filesystem::create_directories(save_directory + "/vel");
+    }
+    catch (const std::exception &e)
+    {
+      ROS_WARN("[initializeFiles] create debug dirs failed: %s", e.what());
+    }
+  }
   if (pcd_save_en && colmap_output_en)
   {
       const std::string folderPath = std::string(ROOT_DIR) + "/scripts/colmap_output.sh";
@@ -193,6 +491,48 @@ void LIVMapper::initializeFiles()
   if(pcd_save_interval > 0) fout_pcd_pos.open(std::string(ROOT_DIR) + "Log/PCD/scans_pos.json", std::ios::out);
   fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), std::ios::out);
   fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
+
+  // ==== Global-LVBA keyframe 数据集导出：建目录 + 复制标定，使数据集自包含 ====
+  if (save_lvba_en_)
+  {
+    namespace fs = std::filesystem;
+    try
+    {
+      fs::create_directories(lvba_out_dir_ + "/pointclouds");
+      fs::create_directories(lvba_out_dir_ + "/odoms");
+      fs::create_directories(lvba_out_dir_ + "/images/" + camera_frame_);
+      // 复制标定文件夹（intrinsics/ + extrinsics/）到 calib/，Global-LVBA keyframe 直接读。
+      // 单独 try/catch：复制失败（如二次运行目标已存在）不应禁掉整个导出。
+      const std::string calib_dst = lvba_out_dir_ + "/calib";
+      if (calib_path_.empty() || !fs::exists(calib_path_))
+      {
+        ROS_WARN("[LVBA export] calib_path 无效，未复制标定；请手动把标定放到 %s/", calib_dst.c_str());
+      }
+      else if (fs::exists(calib_dst + "/intrinsics"))
+      {
+        ROS_INFO("[LVBA export] calib 已存在，跳过复制: %s", calib_dst.c_str());
+      }
+      else
+      {
+        try
+        {
+          fs::create_directories(calib_dst);
+          fs::copy(calib_path_, calib_dst,
+                   fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+        }
+        catch (const std::exception &e)
+        {
+          ROS_WARN("[LVBA export] 复制标定失败（请手动放到 %s/）: %s", calib_dst.c_str(), e.what());
+        }
+      }
+      ROS_INFO("[LVBA export] enabled, output dir: %s", lvba_out_dir_.c_str());
+    }
+    catch (const std::exception &e)
+    {
+      ROS_ERROR("[LVBA export] 建目录/复制标定失败，禁用导出: %s", e.what());
+      save_lvba_en_ = false;
+    }
+  }
 }
 
 void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
@@ -203,8 +543,17 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
   sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
   
-  subGPS_pvt = nh.subscribe<gnss_comm::GnssPVTSolnMsg>("/ublox_driver/receiver_pvt", 2000, &LIVMapper::rtk_cbk, this);
-  
+  // RTK 观测二选一：默认 GNSS PVT；odom_rtk_en=true 时改用 /localization/odom
+  if (odom_rtk_en_)
+  {
+    sub_localization_odom = nh.subscribe<nav_msgs::Odometry>(odom_rtk_topic_, 2000, &LIVMapper::localization_odom_cbk, this);
+    ROS_INFO("[RTK] use odometry topic as RTK source: %s", odom_rtk_topic_.c_str());
+  }
+  else
+  {
+    subGPS_pvt = nh.subscribe<gnss_comm::GnssPVTSolnMsg>("/ublox_driver/receiver_pvt", 2000, &LIVMapper::rtk_cbk, this);
+  }
+
   pub_odom = nh.advertise<nav_msgs::Odometry>("/odometry/fast_livo2", 10000);
   pub_lidarRGB = nh.advertise<sensor_msgs::PointCloud2>("/synced_cloud", 10000);
   pub_rtk = nh.advertise<nav_msgs::Odometry>("/gps/odometry", 10000);
@@ -290,10 +639,10 @@ void LIVMapper::stateEstimationAndMapping()
       ROS_INFO("[HandleLIO] Position after: [%f, %f, %f]", _state.pos_end(0), _state.pos_end(1), _state.pos_end(2));
       ROS_INFO("[HandleLIO] p_cov after: %.12f, %.12f, %.12f", _state.cov(3,3), _state.cov(4,4), _state.cov(5,5));
 
-      // if(rtk_en && rtk_ini)
-      // {
-      //   handleRTK();
-      // }
+      if(rtk_en && rtk_ini)
+      {
+        handleRTK();
+      }
       break;
   }
 }
@@ -382,15 +731,23 @@ void LIVMapper::handleVIO()
     vio_manager->plot_flag = false;
   }
 
+  // processFrame 会把传入图像原地 resize 成小图（cam_scale），故先克隆全分辨率去畸变图供导出
+  cv::Mat lvba_kf_img;
+  if (save_lvba_en_ && !LidarMeasures.measures.empty() && !LidarMeasures.measures.back().img.empty())
+    lvba_kf_img = LidarMeasures.measures.back().img.clone();
+
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
-  if (imu_prop_enable) 
+  if (imu_prop_enable)
   {
     ekf_finish_once = true;
     latest_ekf_state = _state;
     latest_ekf_time = LidarMeasures.last_lio_update_time;
     state_update_flg = true;
   }
+
+  // 导出 Global-LVBA keyframe：用 VIO 更新后的更优位姿覆写 odom + 存去畸变全分辨率图像
+  saveLvbaKeyframeImageOdom(lvba_kf_img);
 
   // int size_sub_map = vio_manager->visual_sub_map_cur.size();
   // visual_sub_map->reserve(size_sub_map);
@@ -464,6 +821,9 @@ void LIVMapper::handleLIO()
   voxelmap_manager->StateEstimation(state_propagat, rtk_good, rtk_data);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
+
+  // 导出 Global-LVBA keyframe：存激光系点云 + odom(LIO 位姿)；同帧 VIO 会再覆写 odom 并存图
+  saveLvbaKeyframeLidar();
 
   double t2 = omp_get_wtime();
 
@@ -628,14 +988,21 @@ void LIVMapper::savePCD()
 void LIVMapper::run() 
 {
   ros::Rate rate(5000);
-  while (ros::ok()) 
+  while (ros::ok())
   {
     ros::spinOnce();
-    if (!sync_packages(LidarMeasures)) 
+    if (!sync_packages(LidarMeasures))
     {
+      // [DEBUG] sync 一直失败时，打印各 buffer 大小，看是哪一路没进来
+      ROS_WARN_THROTTLE(2.0,
+          "[run] sync_packages FAILED (throttle 2s): lidar_buf=%zu imu_buf=%zu img_buf=%zu | lidar_en=%d imu_en=%d img_en=%d | last_ts lidar=%.3f imu=%.3f img=%.3f",
+          lid_raw_data_buffer.size(), imu_buffer.size(), img_buffer.size(),
+          lidar_en, imu_en, img_en, last_timestamp_lidar, last_timestamp_imu, last_timestamp_img);
       rate.sleep();
       continue;
     }
+    ROS_INFO_THROTTLE(2.0, "[run] sync_packages OK (throttle 2s): lidar_buf=%zu imu_buf=%zu img_buf=%zu",
+                      lid_raw_data_buffer.size(), imu_buffer.size(), img_buffer.size());
     handleFirstFrame();
 
     processImu();
@@ -784,7 +1151,10 @@ void LIVMapper::RGBpointBodyToWorld(PointType const *const pi, PointType *const 
 
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
-  if (!lidar_en) return;
+  // [DEBUG] 收到 PointCloud2 就打印（在任何 early-return 之前），确认话题/类型对不对
+  ROS_INFO_THROTTLE(1.0, "[cbk][lidar] recv PointCloud2 on '%s': raw_pts=%u stamp=%.6f (throttle 1s)",
+                    lid_topic.c_str(), msg->width * msg->height, msg->header.stamp.toSec());
+  if (!lidar_en) { ROS_WARN_THROTTLE(2.0, "[cbk][lidar] lidar_en=false, dropping cloud"); return; }
   mtx_buffer.lock();
 
   double cur_head_time = msg->header.stamp.toSec() + lidar_time_offset;
@@ -797,6 +1167,13 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  // [DEBUG] 打印预处理(robosense_handler 等)解析后的点数 + buffer 大小；解析为 0 说明
+  // lidar_type/点云字段不匹配（本次数据是裸 XYZI，无 ring/timestamp）
+  ROS_INFO_THROTTLE(1.0, "[cbk][lidar] after preprocess: parsed_pts=%zu, lidar_buffer=%zu (throttle 1s)",
+                    (ptr ? ptr->size() : 0), lid_raw_data_buffer.size() + 1);
+  if (!ptr || ptr->empty())
+    ROS_WARN_THROTTLE(1.0, "[cbk][lidar] preprocess produced EMPTY cloud (检查 lidar_type=%d 与点云字段是否匹配)",
+                      p_pre->lidar_type);
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -807,7 +1184,9 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
 void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in)
 {
-  if (!lidar_en) return;
+  ROS_INFO_THROTTLE(1.0, "[cbk][lidar-livox] recv CustomMsg on '%s': pts=%u stamp=%.6f (throttle 1s)",
+                    lid_topic.c_str(), (uint32_t)msg_in->point_num, msg_in->header.stamp.toSec());
+  if (!lidar_en) { ROS_WARN_THROTTLE(2.0, "[cbk][lidar-livox] lidar_en=false, dropping cloud"); return; }
   mtx_buffer.lock();
   livox_ros_driver::CustomMsg::Ptr msg(new livox_ros_driver::CustomMsg(*msg_in));
   // if ((abs(msg->header.stamp.toSec() - last_timestamp_lidar) > 0.2 && last_timestamp_lidar > 0) || sync_jump_flag)
@@ -937,7 +1316,114 @@ void LIVMapper::rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
   }
 }
 
-Sophus::SE3 computeSVD(const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& target, 
+// 用 /localization/odom (nav_msgs/Odometry) 当作 RTK 观测填 rtk_buffer。
+// 与 rtk_cbk 的差别：
+//   1) 里程计已经是笛卡尔位姿（UTM/局部地图系），不需要 LLA->ENU，所以不用 gps_trans_；
+//   2) 但要减掉首帧位置当原点，保持和 rtk_cbk 一样的"相对首帧"语义——
+//      InitializeRTK 的 norm()>50 触发条件和 SVD 的数值稳定性都依赖坐标是小数值；
+//   3) 时间戳直接用 header.stamp（同样减 1ms，与 rtk_cbk 对齐 sync_packages 的取帧区间）。
+void LIVMapper::localization_odom_cbk(const nav_msgs::Odometry::ConstPtr& odomMsg)
+{
+    ROS_INFO_THROTTLE(1.0, "RTK(odom) received (throttle 1s)");
+    static bool first_odom = false;
+    static Eigen::Vector3d odom_origin = Eigen::Vector3d::Zero();
+
+    const Eigen::Vector3d p_abs(odomMsg->pose.pose.position.x,
+                                odomMsg->pose.pose.position.y,
+                                odomMsg->pose.pose.position.z);
+    if (!first_odom) {
+        first_odom = true;
+        odom_origin = p_abs;
+        ROS_INFO("[RTK(odom)] origin set to [%.3f, %.3f, %.3f]", odom_origin[0], odom_origin[1], odom_origin[2]);
+        std::ofstream gps_file_header(rtk_save_file, std::ios::out);
+        if (gps_file_header.is_open()) {
+            gps_file_header << "# timestamp x y z vx vy vz h_acc v_acc" << std::endl;
+            gps_file_header.close();
+        }
+    }
+
+    const Eigen::Vector3d trans_local_ = p_abs - odom_origin;
+
+    ros::Time stamp = odomMsg->header.stamp;
+
+    // 速度：不用 twist。ROS 约定 nav_msgs/Odometry 的 twist 在 child_frame_id(车体系)下，
+    // 而 GetRTKCorrectedState 把 rtk.v 当成 UTM 系速度（只乘 T_G_to_W 的旋转）后**硬赋给
+    // state.vel_end**，坐标系一错就是往状态里注入一个方向完全错误的速度。
+    // 这里直接用相邻两条 odom 的位置差分，语义上确定就是 UTM 系速度。
+    // 注意：不能简单留空——RTK::v 是 Eigen 向量，默认构造是未初始化内存，
+    // 硬赋给 vel_end 就是随机速度，比给 0 更糟。
+    static bool has_prev = false;
+    static double prev_ts = 0.0;
+    static Eigen::Vector3d prev_p_abs = Eigen::Vector3d::Zero();
+    static Eigen::Vector3d last_vel = Eigen::Vector3d::Zero();
+
+    const double ts = stamp.toSec();
+    if (has_prev)
+    {
+      const double dt = ts - prev_ts;
+      if (dt > 1e-3 && dt < 0.5) last_vel = (p_abs - prev_p_abs) / dt;  // dt 异常(重复戳/大跳变)时沿用上一次
+    }
+    has_prev = true;
+    prev_ts = ts;
+    prev_p_abs = p_abs;
+
+    RTK rtk_data;
+    rtk_data.timestamp = ts; // - 0.001;
+    rtk_data.p[0] = trans_local_[0];
+    rtk_data.p[1] = trans_local_[1];
+    rtk_data.p[2] = trans_local_[2];
+    rtk_data.v = last_vel;
+
+    rtk_buffer.push_back(rtk_data);
+    ROS_INFO_THROTTLE(1.0, "rtk_data_pushed(odom): t=%.6f p=[%.3f, %.3f, %.3f] v=[%.2f, %.2f, %.2f] |v|=%.2f (throttle 1s)",
+                      rtk_data.timestamp, rtk_data.p[0], rtk_data.p[1], rtk_data.p[2],
+                      rtk_data.v[0], rtk_data.v[1], rtk_data.v[2], rtk_data.v.norm());
+
+    if(trans_local_.norm() > 50.0 && rtk_ini == false && rtk_en == true)
+    {
+      ROS_INFO("Start INIT RTK to LIVO TRANSFORMATION");
+      InitializeRTK();
+      ROS_INFO("RTK to LIVO TRANSFORMATION INITIALIZED");
+      rtk_ini = true;
+    }
+
+    // 与 rtk_cbk 一致：把折算到首帧原点的位置作为 /gps/odometry 发出去，便于 rviz 对比
+    nav_msgs::Odometry gps_odom;
+    gps_odom.header.stamp = stamp;
+    gps_odom.header.frame_id = "camera_init";
+    gps_odom.pose.pose.position.x = trans_local_[0];
+    gps_odom.pose.pose.position.y = trans_local_[1];
+    gps_odom.pose.pose.position.z = trans_local_[2];
+    gps_odom.pose.pose.orientation = odomMsg->pose.pose.orientation;
+    gps_odom.twist = odomMsg->twist;
+    // 位置协方差沿用上游 odom 的 xx/yy/zz（没填就是 0）
+    gps_odom.pose.covariance[0]  = odomMsg->pose.covariance[0];
+    gps_odom.pose.covariance[7]  = odomMsg->pose.covariance[7];
+    gps_odom.pose.covariance[14] = odomMsg->pose.covariance[14];
+
+    pub_rtk.publish(gps_odom);
+
+    if(debug_mode)
+    {
+      std::ofstream gps_file(rtk_save_file, std::ios::app);
+      if (gps_file.is_open()) {
+          gps_file << std::fixed << std::setprecision(6)
+                  << gps_odom.header.stamp.toSec() << " "        // 1. timestamp
+                  << trans_local_[0] << " "                      // 2. x
+                  << trans_local_[1] << " "                      // 3. y
+                  << trans_local_[2] << " "                      // 4. z
+                  << rtk_data.v[0] << " "                        // 5. vx
+                  << rtk_data.v[1] << " "                        // 6. vy
+                  << rtk_data.v[2] << " "                        // 7. vz
+                  << std::sqrt(std::max(0.0, odomMsg->pose.covariance[0])) << " "   // 8. h_acc(≈std)
+                  << std::sqrt(std::max(0.0, odomMsg->pose.covariance[14]))         // 9. v_acc(≈std)
+                  << std::endl;
+          gps_file.close();
+      }
+    }
+}
+
+Sophus::SE3 computeSVD(const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& target,
     const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& source)
 {
     if (target.empty() || target.size() != source.size()) {
@@ -1025,9 +1511,16 @@ void LIVMapper::InitializeRTK()
 
 void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
-  if (!imu_en) return;
+  // [DEBUG] 收到 IMU 就打印（在任何 early-return 之前），确认话题对不对
+  ROS_INFO_THROTTLE(1.0, "[cbk][imu] recv Imu on '%s': stamp=%.6f (throttle 1s)",
+                    imu_topic.c_str(), msg_in->header.stamp.toSec());
+  if (!imu_en) { ROS_WARN_THROTTLE(2.0, "[cbk][imu] imu_en=false, dropping"); return; }
 
-  if (last_timestamp_lidar < 0.0) return;
+  // 注意：first lidar 到达之前，IMU 会被这里直接丢弃（下游 sync 依赖 last_timestamp_lidar）
+  if (last_timestamp_lidar < 0.0) {
+    ROS_WARN_THROTTLE(1.0, "[cbk][imu] last_timestamp_lidar<0（还没收到/解析到 LiDAR），IMU 暂被丢弃");
+    return;
+  }
   // ROS_INFO("get imu at time: %.6f", msg_in->header.stamp.toSec());
   sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
   msg->header.stamp = ros::Time().fromSec(msg->header.stamp.toSec() - imu_time_offset);
@@ -1107,12 +1600,32 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
 {
   cv::Mat img;
   img = cv_bridge::toCvCopy(img_msg, "bgr8")->image;
+  // 整幅去畸变（在任何下游使用之前）：仅当映射已按该分辨率构建、且图像尺寸匹配时执行。
+  // 去畸变后图像为 rectified，配合零畸变的针孔相机模型使用（见 loadCalibrationFromFiles）。
+  if (undistort_ready_)
+  {
+    if (img.cols == calib_img_width_ && img.rows == calib_img_height_)
+    {
+      cv::Mat rectified;
+      cv::remap(img, rectified, undist_map1_, undist_map2_, cv::INTER_LINEAR);
+      img = rectified;
+    }
+    else
+    {
+      ROS_WARN_THROTTLE(2.0,
+          "[cbk][img] 图像尺寸 %dx%d 与标定分辨率 %dx%d 不一致，跳过去畸变（检查内参 ImageWidth/Height 是否匹配数据）",
+          img.cols, img.rows, calib_img_width_, calib_img_height_);
+    }
+  }
   return img;
 }
 
 void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 {
-  if (!img_en) return;
+  // [DEBUG] 收到图像就打印（在任何 early-return 之前），确认话题对不对
+  ROS_INFO_THROTTLE(1.0, "[cbk][img] recv Image on '%s': %dx%d stamp=%.6f (throttle 1s)",
+                    img_topic.c_str(), msg_in->width, msg_in->height, msg_in->header.stamp.toSec());
+  if (!img_en) { ROS_WARN_THROTTLE(2.0, "[cbk][img] img_en=false, dropping"); return; }
   sensor_msgs::Image::Ptr msg(new sensor_msgs::Image(*msg_in));
   // if ((abs(msg->header.stamp.toSec() - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
   // {
@@ -1122,16 +1635,20 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   // }
 
   // Hiliti2022 40Hz
-  if (hilti_en)
+  // if (hilti_en)
+  if (1)
   {
     static int frame_counter = 0;
-    if (++frame_counter % 4 != 0) return;
+    if (++frame_counter % 3 != 0) return;
   }
   // double msg_header_time =  msg->header.stamp.toSec();
   double msg_header_time = msg->header.stamp.toSec() + img_time_offset;
   if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
   //ROS_INFO("Get image, its header time: %.6f", msg_header_time);
-  if (last_timestamp_lidar < 0) return;
+  if (last_timestamp_lidar < 0) {
+    ROS_WARN_THROTTLE(1.0, "[cbk][img] last_timestamp_lidar<0（还没收到/解析到 LiDAR），图像暂被丢弃");
+    return;
+  }
 
   if (msg_header_time < last_timestamp_img)
   {
@@ -1531,8 +2048,9 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           std::stringstream ss;
           ss << std::setfill('0') << std::setw(6) << pcd_file_index;
           std::string pcd_filename = pcd_save_file + ss.str() + ".pcd";    
-          pcl::io::savePCDFileBinary(pcd_filename, *laserCloudBodyRGB);
-          pcd_file_index++;
+          try { pcl::io::savePCDFileBinary(pcd_filename, *laserCloudBodyRGB); pcd_file_index++; }
+          catch (const std::exception &e)
+          { ROS_WARN_THROTTLE(5.0, "[debug pcd] write failed: %s (%s)", pcd_filename.c_str(), e.what()); }
       }
     }
   }
@@ -1564,8 +2082,9 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           std::stringstream ss;
           ss << std::setfill('0') << std::setw(6) << pcd_file_index;
           std::string pcd_filename = pcd_save_file + ss.str() + ".pcd";
-          pcl::io::savePCDFileBinary(pcd_filename, *laserCloudBody);
-          pcd_file_index++;
+          try { pcl::io::savePCDFileBinary(pcd_filename, *laserCloudBody); pcd_file_index++; }
+          catch (const std::exception &e)
+          { ROS_WARN_THROTTLE(5.0, "[debug pcd] write failed: %s (%s)", pcd_filename.c_str(), e.what()); }
         }
       }
   }
@@ -1590,9 +2109,6 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   odom_msg_ekf.pose.pose.orientation.x = q.x();
   odom_msg_ekf.pose.pose.orientation.y = q.y();
   odom_msg_ekf.pose.pose.orientation.z = q.z();
-  odom_msg_ekf.twist.twist.linear.x = _state.vel_end(0);
-  odom_msg_ekf.twist.twist.linear.y = _state.vel_end(1);
-  odom_msg_ekf.twist.twist.linear.z = _state.vel_end(2);
   Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> pose_cov_map(odom_msg_ekf.pose.covariance.data());
 
   pose_cov_map.block<3, 3>(0, 0) = _state.cov.block<3, 3>(3, 3);
@@ -1610,13 +2126,10 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
                   << _state.pos_end(0) << " "
                   << _state.pos_end(1) << " "
                   << _state.pos_end(2) << " "
-	                  << q.x() << " "
-	                  << q.y() << " "
-	                  << q.z() << " "
-	                  << q.w() << " "
-	                  << _state.vel_end(0) << " "
-	                  << _state.vel_end(1) << " "
-	                  << _state.vel_end(2) << std::endl;
+                  << q.x() << " "
+                  << q.y() << " "
+                  << q.z() << " "
+                  << q.w() << std::endl;
         odom_file.close();
     }
 

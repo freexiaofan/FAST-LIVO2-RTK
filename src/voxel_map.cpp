@@ -47,6 +47,19 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<int>("lio/max_points_num", voxel_config.max_points_num_, 50);
   nh.param<int>("lio/max_iterations", voxel_config.max_iterations_, 5);
 
+  // RTK 观测噪声：默认 xy 5cm、z 关闭(1e3)。z 关闭的理由见 gps/rtk_std 注释
+  nh.param<vector<double>>("gps/rtk_std", voxel_config.rtk_std_, vector<double>{0.05, 0.05, 1e3});
+  if (voxel_config.rtk_std_.size() != 3)
+  {
+    ROS_WARN("[loadVoxelConfig] gps/rtk_std 需要 3 个元素，收到 %zu 个，回退默认 [0.05, 0.05, 1e3]",
+             voxel_config.rtk_std_.size());
+    voxel_config.rtk_std_ = vector<double>{0.05, 0.05, 1e3};
+  }
+  for (double &s : voxel_config.rtk_std_)
+    if (s <= 1e-9) { ROS_WARN("[loadVoxelConfig] gps/rtk_std 含非正值，改用 1e-3"); s = 1e-3; }
+  ROS_INFO("[loadVoxelConfig] gps/rtk_std = [%.4g, %.4g, %.4g]",
+           voxel_config.rtk_std_[0], voxel_config.rtk_std_[1], voxel_config.rtk_std_[2]);
+
   nh.param<bool>("local_map/map_sliding_en", voxel_config.map_sliding_en, false);
   nh.param<int>("local_map/half_map_size", voxel_config.half_map_size, 100);
   nh.param<double>("local_map/sliding_thresh", voxel_config.sliding_thresh, 8);
@@ -411,6 +424,8 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat, bool rtk_good
       effct_feat_num_ += 3;
     }
 
+    // todo 可能有越界？？？
+    
     MatrixXd Hsub(effct_feat_num_, 6);
     MatrixXd Hsub_T_R_inv(6, effct_feat_num_);
     VectorXd R_inv(effct_feat_num_);
@@ -464,7 +479,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat, bool rtk_good
 
     if (rtk_good)
     {
-        ROS_INFO("RTK update in EKF.");
+        ROS_INFO_THROTTLE(1.0, "RTK update in EKF. (throttle 1s)");
         
         int rtk_start_idx = effct_feat_num_ - 3;
         
@@ -472,12 +487,14 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat, bool rtk_good
         V3D rtk_ext_t;  
         //rtk_ext_t << -0.0588, 0.02316, 0.1162;
         rtk_ext_t << 0, 0, 0;
-        V3D rtk_std;    
-        rtk_std << 0.003, 0.003, 0.1; 
+        // 观测噪声改由 gps/rtk_std 配置（默认 xy 5cm、z 1e3=关闭）
+        V3D rtk_std(config_setting_.rtk_std_[0], config_setting_.rtk_std_[1], config_setting_.rtk_std_[2]);
 
         V3D rtk_est = state_.pos_end + state_.rot_end * rtk_ext_t;
-        V3D rtk_residual = rtk_means - rtk_est; 
-        ROS_INFO("rtk_residual: [%f, %f, %f]", rtk_residual[0], rtk_residual[1], rtk_residual[2]);
+        V3D rtk_residual = rtk_means - rtk_est;
+        ROS_INFO_THROTTLE(1.0, "rtk_residual: [%f, %f, %f] (std=[%.4g, %.4g, %.4g], throttle 1s)",
+                          rtk_residual[0], rtk_residual[1], rtk_residual[2],
+                          rtk_std[0], rtk_std[1], rtk_std[2]);
 
         // H_RTK 计算
         M3D rtk_ext_t_skew;
@@ -734,6 +751,11 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
       if (!is_sucess)
       {
+        // ! todo
+        // 而 voxel_center_ 是在世界坐标(米)下算出来的(voxel_center_[0] = (0.5 + position.x) * voxel_size,voxel_map.cpp:634),
+        // 和 pv.point_w(原始世界坐标,米)是同一个量纲。loc_xyz 却是 point_w / voxel_size,量纲上差了一个 voxel_size 的倍数。
+        // 这两个量只有 voxel_size == 1.0 时才碰巧同尺度
+
         VOXEL_LOCATION near_position = position;
         if (loc_xyz[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_)) { near_position.x = near_position.x + 1; }
         else if (loc_xyz[0] < (current_octo->voxel_center_[0] - current_octo->quater_length_)) { near_position.x = near_position.x - 1; }

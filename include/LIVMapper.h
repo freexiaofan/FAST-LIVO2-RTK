@@ -16,11 +16,12 @@ which is included as part of this source code package.
 #include "IMU_Processing.h"
 #include "vio.h"
 #include "preprocess.h"
+#include "sensor_extrinsics.hpp"
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
-#include <vikit/camera_loader.h>
-#include <gnss_comm/GnssPVTSolnMsg.h>     
+#include <vikit/pinhole_camera.h>
+#include <gnss_comm/GnssPVTSolnMsg.h>
 #include <GeographicLib/LocalCartesian.hpp>
 
 class LIVMapper
@@ -53,6 +54,8 @@ public:
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg);
+  // 用 /localization/odom (nav_msgs/Odometry) 顶替 GNSS PVT 填充 rtk_buffer
+  void localization_odom_cbk(const nav_msgs::Odometry::ConstPtr& odomMsg);
   void InitializeRTK();
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
@@ -62,6 +65,11 @@ public:
   void publish_mavros(const ros::Publisher &mavros_pose_publisher);
   void publish_path(const ros::Publisher pubPath);
   void readParameters(ros::NodeHandle &nh);
+  bool loadCalibrationFromFiles();
+  // 导出为 Global-LVBA keyframe 数据集（供其做二次 LiDAR-Visual BA）
+  void saveLvbaKeyframeLidar();                        // handleLIO 调用：存激光系点云 + odom(LIO 位姿)
+  void saveLvbaKeyframeImageOdom(const cv::Mat &img);  // handleVIO 调用：存去畸变图 + 覆写 odom(VIO 位姿)
+  bool writeLvbaOdom(const std::string &stem, const StatesGroup &st, double ts);  // 写 odoms/{stem}.yaml (T_utm_ins)
   template <typename T> void set_posestamp(T &out);
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
   template <typename T> Eigen::Matrix<T, 3, 1> pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi);
@@ -135,6 +143,24 @@ public:
   vector<double> cameraextrinR;
   double IMG_POINT_COV;
 
+  // 内外参标定文件（格式/目录结构与 Global-LVBA 的 keyframe 模式一致：
+  // calib_path_/intrinsics/<camera_frame_>_Intrinsic.yaml
+  // calib_path_/extrinsics/{id}_{sensor}_2_{parent}_Extrinsics.yaml）
+  std::string calib_path_;
+  std::string lidar_frame_;
+  std::string vehicle_frame_;
+  std::string imu_frame_;      // IMU(ins) 坐标系名——lidar->IMU 外参要查到这个系，不是 vehicle
+  std::string camera_frame_;
+  double cam_scale_ = 1.0;
+
+  // 图像整幅去畸变：本相机是 8 参数 rational 畸变模型，vk::PinholeCamera 的解析畸变
+  // (最多5参数) 表达不了，故在图像入口用 cv::remap 整幅去畸变，相机模型构造为零畸变(纯针孔)，
+  // 避免和 world2cam 里的解析畸变重复处理。
+  bool undistort_en_ = true;
+  bool undistort_ready_ = false;   // 去畸变映射是否已构建成功
+  int calib_img_width_ = 0, calib_img_height_ = 0;  // 去畸变映射对应的原图分辨率
+  cv::Mat undist_map1_, undist_map2_;
+
   PointCloudXYZI::Ptr visual_sub_map;
   PointCloudXYZI::Ptr feats_undistort;
   PointCloudXYZI::Ptr feats_down_body;
@@ -171,6 +197,7 @@ public:
   ros::Subscriber sub_imu;
   ros::Subscriber sub_img;
   ros::Subscriber subGPS_pvt;
+  ros::Subscriber sub_localization_odom;
   ros::Publisher pubLaserCloudFullRes;
   ros::Publisher pubNormal;
   ros::Publisher pubSubVisualMap;
@@ -193,6 +220,9 @@ public:
 
   bool rtk_en = false;
   bool rtk_ini = false;
+  // RTK 观测来源换成 /localization/odom（nav_msgs/Odometry）而不是 GNSS PVT
+  bool odom_rtk_en_ = false;
+  std::string odom_rtk_topic_;
   bool rtk_good = false;
   std::deque<RTK> rtk_buffer;
   std::deque<RTK> rtk_proc_buffer;
@@ -211,6 +241,13 @@ public:
   std::string cov_save_file; 
   
   double keyframe_time = 0.0;
+
+  // ==== Global-LVBA keyframe 数据集导出 ====
+  bool save_lvba_en_ = false;        // 是否导出为 Global-LVBA keyframe 格式
+  std::string lvba_out_dir_;         // 输出根目录（下建 pointclouds/ odoms/ images/<cam>/ calib/）
+  int lvba_kf_index_ = -1;           // 关键帧序号：每个 LIO 关键帧 +1，作为文件名 {idx}_{ts} 的 idx
+  std::string lvba_cur_stem_;        // 当前关键帧主干 {idx}_{ts}（LIO 存点云/odom，VIO 存图并覆写 odom 时复用）
+  double lvba_cur_kf_time_ = -1.0;   // 当前已存激光关键帧的时间戳，用于 VIO 端严格配对
 
   ros::Subscriber sub_gps;
   ros::Publisher pub_odom;
