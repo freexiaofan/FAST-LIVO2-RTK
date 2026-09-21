@@ -600,8 +600,8 @@ Visualization Manager:
   Value: true
   Views:
     Current:
-      Class: rviz/ThirdPersonFollower
-      Distance: 274.6966552734375
+      Class: rviz/Orbit
+      Distance: 85.65605163574219
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -609,38 +609,18 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 240.26731872558594
-        Y: -13.301960945129395
-        Z: 0
-      Focal Shape Fixed Size: true
+        X: 28.252656936645508
+        Y: -35.49672317504883
+        Z: -36.31112289428711
+      Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5697963237762451
-      Target Frame: drone
-      Yaw: 4.458574295043945
+      Pitch: 0.5653983950614929
+      Target Frame: <Fixed Frame>
+      Yaw: 0.9104044437408447
     Saved:
-      - Class: rviz/Orbit
-        Distance: 117.53474426269531
-        Enable Stereo Rendering:
-          Stereo Eye Separation: 0.05999999865889549
-          Stereo Focal Distance: 1
-          Swap Stereo Eyes: false
-          Value: false
-        Field of View: 0.7853981852531433
-        Focal Point:
-          X: -35.713138580322266
-          Y: 36.932613372802734
-          Z: 4.459701061248779
-        Focal Shape Fixed Size: false
-        Focal Shape Size: 0.05000000074505806
-        Invert Z Axis: false
-        Name: far1
-        Near Clip Distance: 0.009999999776482582
-        Pitch: 0.19539840519428253
-        Target Frame: <Fixed Frame>
-        Yaw: 0.17540442943572998
       - Class: rviz/Orbit
         Distance: 109.3125
         Enable Stereo Rendering:
@@ -661,6 +641,20 @@ Visualization Manager:
         Pitch: 0.035398442298173904
         Target Frame: <Fixed Frame>
         Yaw: 5.793589115142822
+      - Angle: 0
+        Class: rviz/TopDownOrtho
+        Enable Stereo Rendering:
+          Stereo Eye Separation: 0.05999999865889549
+          Stereo Focal Distance: 1
+          Swap Stereo Eyes: false
+          Value: false
+        Invert Z Axis: false
+        Name: TopDownOrtho
+        Near Clip Distance: 0.009999999776482582
+        Scale: 10
+        Target Frame: drone
+        X: 0
+        Y: 0
       - Class: rviz/Orbit
         Distance: 85.65605163574219
         Enable Stereo Rendering:
@@ -676,45 +670,11 @@ Visualization Manager:
         Focal Shape Fixed Size: false
         Focal Shape Size: 0.05000000074505806
         Invert Z Axis: false
-        Name: near1
+        Name: Orbit
         Near Clip Distance: 0.009999999776482582
         Pitch: 0.5653983950614929
         Target Frame: <Fixed Frame>
         Yaw: 0.9104044437408447
-      - Class: rviz/Orbit
-        Distance: 60.1053581237793
-        Enable Stereo Rendering:
-          Stereo Eye Separation: 0.05999999865889549
-          Stereo Focal Distance: 1
-          Swap Stereo Eyes: false
-          Value: false
-        Field of View: 0.7853981852531433
-        Focal Point:
-          X: 30.61589241027832
-          Y: 29.98663330078125
-          Z: -12.290168762207031
-        Focal Shape Fixed Size: false
-        Focal Shape Size: 0.05000000074505806
-        Invert Z Axis: false
-        Name: near2
-        Near Clip Distance: 0.009999999776482582
-        Pitch: 0.315398633480072
-        Target Frame: <Fixed Frame>
-        Yaw: 5.788588047027588
-      - Angle: 0
-        Class: rviz/TopDownOrtho
-        Enable Stereo Rendering:
-          Stereo Eye Separation: 0.05999999865889549
-          Stereo Focal Distance: 1
-          Swap Stereo Eyes: false
-          Value: false
-        Invert Z Axis: false
-        Name: TopDownOrtho
-        Near Clip Distance: 0.009999999776482582
-        Scale: 10
-        Target Frame: drone
-        X: 0
-        Y: 0
 Window Geometry:
   Displays:
     collapsed: false
@@ -733,5 +693,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 2490
-  X: 1990
+  X: 70
   Y: 27

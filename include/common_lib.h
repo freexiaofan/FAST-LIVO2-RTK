@@ -66,6 +66,10 @@ struct RTK
     double timestamp;
     V3D p;
     V3D v;
+    // gps/rtk_robust_recovery_en=true 时，由 rtk_cbk/localization_odom_cbk
+    // 标记：这一条是断流(间隔 > gps/rtk_gap_thresh)后收到的第一条数据，
+    // 位置很可能和当前 LIO/VIO 估计有较大偏差、速度差分也可能跨越了断流期。
+    bool is_resume = false;
 };
 
 struct MeasureGroup

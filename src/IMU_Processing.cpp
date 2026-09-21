@@ -552,9 +552,16 @@ void ImuProcess::GetRTKCorrectedState(LidarMeasureGroup &lidar_meas, const State
   auto rtk_data = meas.rtk; 
   double rtk_t = rtk_data.timestamp;
 
-  if (meas.rtk.timestamp <= 0.001) 
+  if (meas.rtk.timestamp <= 0.001)
   {
-      return; 
+      return;
+  }
+
+  if (rtk_robust_recovery_en && rtk_data.is_resume)
+  {
+      ROS_WARN("[RTKCorrect] gap-recovery sample (t=%.6f), skip hard pos/vel reset + cov clear, "
+               "leave correction to the weighted RTK updates instead.", rtk_t);
+      return;
   }
 
   ROS_INFO("[RTK Corrected State]");

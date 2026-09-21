@@ -100,6 +100,14 @@ gps:
   # 对实测残差（xy 十几厘米、z 数米）过于乐观：位置被钉死后激光残差只能靠旋转去消，姿态被带跑。
   # z 给 1e3 = 实质关闭 z 观测（与 handleRTK 里 z_k[2]=state.z 的做法一致）。
   rtk_std: [0.05, 0.05, 1000.0]
+  # 断流恢复健壮性处理总开关（默认关，行为与之前完全一致）：
+  # 打开后，RTK/odom_rtk 断流(间隔>rtk_gap_thresh)恢复的第一条样本会跳过
+  # GetRTKCorrectedState 的硬複位(pos/vel直接覆盖+协方差清零)，
+  # 并且 handleRTK/handleLIO 会对 RTK 位置新息做 rtk_innov_gate 倍 sigma 的门限校验，
+  # 超过门限的样本本帧直接丢弃、不参与修正。
+  rtk_robust_recovery_en: false
+  rtk_gap_thresh: 1.0     # 秒
+  rtk_innov_gate: 5.0     # sigma 倍数
 
 opt:
   load_data: false

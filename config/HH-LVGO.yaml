@@ -102,6 +102,10 @@ gps:
   # 对实测残差（xy 十几厘米、z 数米）过于乐观：位置被钉死后激光残差只能靠旋转去消，姿态被带跑。
   # z 给 1e3 = 实质关闭 z 观测（与 handleRTK 里 z_k[2]=state.z 的做法一致）。
   rtk_std: [0.05, 0.05, 0.10]
+  # 断流恢复健壮性处理总开关（默认关，行为与之前完全一致），详见 AGV-LVGO.yaml 里的注释。
+  rtk_robust_recovery_en: false
+  rtk_gap_thresh: 1.0     # 秒
+  rtk_innov_gate: 5.0     # sigma 倍数
 
 opt:
   load_data: false

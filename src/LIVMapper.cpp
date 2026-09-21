@@ -128,6 +128,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("gps/odom_rtk_en", odom_rtk_en_, false);
   nh.param<std::string>("gps/odom_rtk_topic", odom_rtk_topic_, "/localization/odom");
   if (odom_rtk_en_) rtk_en = true;
+  // 断流恢复健壮性处理总开关，见 LIVMapper.h 里的注释；默认 false，行为与之前一致。
+  nh.param<bool>("gps/rtk_robust_recovery_en", rtk_robust_recovery_en_, false);
+  nh.param<double>("gps/rtk_gap_thresh", rtk_gap_thresh_, 1.0);
+  nh.param<double>("gps/rtk_innov_gate", rtk_innov_gate_, 5.0);
   nh.param<vector<double>>("gps/extrinsic_T", T_I_R, vector<double>());
   nh.param<std::string>("laserMapping/outputfilepath", save_directory, "");
   // ==== 导出为 Global-LVBA keyframe 数据集（二次 LiDAR-Visual BA 用）====
@@ -444,6 +448,7 @@ void LIVMapper::initializeComponents()
   p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_imu_init_frame_num(imu_int_frame);
+  p_imu->rtk_robust_recovery_en = rtk_robust_recovery_en_;
 
   if (!imu_en) p_imu->disable_imu();
   if (!gravity_est_en) p_imu->disable_gravity_est();
@@ -647,6 +652,21 @@ void LIVMapper::stateEstimationAndMapping()
   }
 }
 
+// gps/rtk_robust_recovery_en 打开时用于门限校验 RTK 位置新息：按轴比较残差和
+// sqrt(当前状态位置协方差 + 观测噪声方差)，超过 rtk_innov_gate_ 倍就判定为不可信
+// （典型场景：断流恢复瞬间的第一批样本、或上游定位节点自身跳变/野值）。
+bool LIVMapper::rtkInnovationOk(const Eigen::Vector3d &rtk_pos, const Eigen::Vector3d &meas_std)
+{
+  const Eigen::Vector3d residual = rtk_pos - _state.pos_end;
+  for (int i = 0; i < 3; i++)
+  {
+    double sigma = std::sqrt(std::max(_state.cov(3 + i, 3 + i), 0.0) + meas_std[i] * meas_std[i]);
+    sigma = std::max(sigma, 1e-6);
+    if (std::fabs(residual[i]) > rtk_innov_gate_ * sigma) return false;
+  }
+  return true;
+}
+
 void LIVMapper::handleRTK()
 {
   ROS_INFO("%s[ RTK Update ]%s", BLUE, RESET);
@@ -689,6 +709,17 @@ void LIVMapper::handleRTK()
   Eigen::Matrix<double, DIM_STATE, 3> K = P * H.transpose() * S.inverse();
   Eigen::Vector3d y = z_k - (_state.pos_end + _state.rot_end * T_I_to_R);
   ROS_INFO("[HandleRTK] y: [%f, %f, %f]", y(0), y(1), y(2));
+
+  if (rtk_robust_recovery_en_)
+  {
+    double maha = std::sqrt(std::max((y.transpose() * S.inverse() * y)(0, 0), 0.0));
+    if (maha > rtk_innov_gate_)
+    {
+      ROS_WARN("[HandleRTK] innovation gate failed: maha=%.2f sigma > gate=%.2f, skip this RTK correction", maha, rtk_innov_gate_);
+      return;
+    }
+  }
+
   Eigen::Matrix<double, DIM_STATE, 1> dx = K * y;
   ROS_INFO("[HandleRTK] dx: [%f, %f, %f, %f, %f, %f]", dx(0), dx(1), dx(2), dx(3), dx(4), dx(5));
   _state += dx;
@@ -807,7 +838,7 @@ void LIVMapper::handleLIO()
 
   double t1 = omp_get_wtime();
 
-  V3D rtk_data = LidarMeasures.measures.back().rtk.p; 
+  V3D rtk_data = LidarMeasures.measures.back().rtk.p;
   if(rtk_ini && LidarMeasures.measures.back().rtk.timestamp > 0.00001)
   {
     rtk_good = true;
@@ -816,7 +847,18 @@ void LIVMapper::handleLIO()
   {
     rtk_good = false;
   }
-  
+
+  if (rtk_good && rtk_robust_recovery_en_)
+  {
+    const auto &rtk_std = voxelmap_manager->config_setting_.rtk_std_;
+    Eigen::Vector3d meas_std(rtk_std[0], rtk_std[1], rtk_std[2]);
+    if (!rtkInnovationOk(rtk_data, meas_std))
+    {
+      ROS_WARN("[HandleLIO] RTK innovation gate failed, skip RTK rows in StateEstimation this frame");
+      rtk_good = false;
+    }
+  }
+
   ROS_INFO("[HandleLIO] RTW_W: [%f, %f, %f]", rtk_data(0), rtk_data(1), rtk_data(2));
   voxelmap_manager->StateEstimation(state_propagat, rtk_good, rtk_data);
   _state = voxelmap_manager->state_;
@@ -1263,6 +1305,16 @@ void LIVMapper::rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
     rtk_data.v[0] = gpsMsg->vel_e;
     rtk_data.v[1] = gpsMsg->vel_n;
     rtk_data.v[2] = -gpsMsg->vel_d;
+
+    // gps/rtk_robust_recovery_en：与上一条 GNSS PVT 的间隔超过 rtk_gap_thresh_ 视为断流恢复，
+    // 标记后交给 GetRTKCorrectedState/handleRTK/handleLIO 做特殊处理（见各处调用点注释）。
+    static double last_recv_ts = -1.0;
+    if (rtk_robust_recovery_en_ && last_recv_ts >= 0.0 && rtk_data.timestamp - last_recv_ts > rtk_gap_thresh_)
+    {
+      rtk_data.is_resume = true;
+      ROS_WARN("[RTK] gap detected: %.3fs (> %.3fs), mark next sample as resume", rtk_data.timestamp - last_recv_ts, rtk_gap_thresh_);
+    }
+    last_recv_ts = rtk_data.timestamp;
     
     rtk_buffer.push_back(rtk_data);
     ROS_INFO("rtk_data_pushed: %.6f, %.3f, %.3f, %.3f", rtk_data.timestamp, rtk_data.p[0], rtk_data.p[1], rtk_data.p[2]);
@@ -1358,9 +1410,18 @@ void LIVMapper::localization_odom_cbk(const nav_msgs::Odometry::ConstPtr& odomMs
     static Eigen::Vector3d last_vel = Eigen::Vector3d::Zero();
 
     const double ts = stamp.toSec();
+    // gps/rtk_robust_recovery_en：与上一条 odom 的间隔超过 rtk_gap_thresh_ 视为断流恢复。
+    // 注意这条刚恢复的样本 last_vel 仍是断流前算出的陈旧值(见上面 dt<0.5 的判断)，
+    // 标记 is_resume 后 GetRTKCorrectedState 会整体跳过硬複位，陈旧速度也就不会被用上。
+    bool is_gap_resume = false;
     if (has_prev)
     {
       const double dt = ts - prev_ts;
+      if (rtk_robust_recovery_en_ && dt > rtk_gap_thresh_)
+      {
+        is_gap_resume = true;
+        ROS_WARN("[RTK(odom)] gap detected: %.3fs (> %.3fs), mark this sample as resume", dt, rtk_gap_thresh_);
+      }
       if (dt > 1e-3 && dt < 0.5) last_vel = (p_abs - prev_p_abs) / dt;  // dt 异常(重复戳/大跳变)时沿用上一次
     }
     has_prev = true;
@@ -1369,6 +1430,7 @@ void LIVMapper::localization_odom_cbk(const nav_msgs::Odometry::ConstPtr& odomMs
 
     RTK rtk_data;
     rtk_data.timestamp = ts; // - 0.001;
+    rtk_data.is_resume = is_gap_resume;
     rtk_data.p[0] = trans_local_[0];
     rtk_data.p[1] = trans_local_[1];
     rtk_data.p[2] = trans_local_[2];

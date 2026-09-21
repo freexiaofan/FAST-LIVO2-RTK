@@ -61,6 +61,10 @@ public:
   double first_lidar_time;
   bool imu_time_init = false;
   bool imu_need_init = true;
+  // gps/rtk_robust_recovery_en：断流恢复后的第一条 RTK/odom 样本(rtk.is_resume==true)
+  // 不再做“硬複位 pos/vel + 协方差清零”，改为跳过，交给 handleRTK / StateEstimation
+  // 里的加权观测更新去处理，避免断流越久跳变越大、以及注入断流期间算出的陈旧速度。
+  bool rtk_robust_recovery_en = false;
   M3D Eye3d;
   V3D Zero3d;
   int lidar_type;

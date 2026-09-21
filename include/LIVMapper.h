@@ -57,6 +57,9 @@ public:
   // 用 /localization/odom (nav_msgs/Odometry) 顶替 GNSS PVT 填充 rtk_buffer
   void localization_odom_cbk(const nav_msgs::Odometry::ConstPtr& odomMsg);
   void InitializeRTK();
+  // gps/rtk_robust_recovery_en 打开时，handleRTK / handleLIO 用它对 RTK 位置新息做门限校验：
+  // 残差在 rtk_innov_gate_ 倍 sigma(当前位置协方差 + 观测噪声) 以内才认为可信。
+  bool rtkInnovationOk(const Eigen::Vector3d &rtk_pos, const Eigen::Vector3d &meas_std);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -224,6 +227,12 @@ public:
   bool odom_rtk_en_ = false;
   std::string odom_rtk_topic_;
   bool rtk_good = false;
+  // 断流恢复健壮性处理总开关：关闭时行为与之前完全一致(硬複位+无门限)。
+  // 打开后：1) 断流(间隔>rtk_gap_thresh_)后第一条样本跳过硬複位+协方差清零+陈旧速度注入；
+  //        2) handleRTK/handleLIO 对 RTK 位置新息做门限校验，超过 rtk_innov_gate_ 倍 sigma 则丢弃该次修正。
+  bool rtk_robust_recovery_en_ = false;
+  double rtk_gap_thresh_ = 1.0;   // 秒；超过此间隔视为“断流后恢复”
+  double rtk_innov_gate_ = 5.0;   // 新息门限，单位：sigma 倍数
   std::deque<RTK> rtk_buffer;
   std::deque<RTK> rtk_proc_buffer;
   std::deque<std::vector<double>> livo_state_buffer;
