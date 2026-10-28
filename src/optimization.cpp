@@ -673,16 +673,18 @@ void optimization::initialAlign()
 void optimization::buildBatchGraph()
 {
     gtSAMgraph.resize(0); 
-
-    ROS_INFO("rtk_cox, livo2_RPY_cov, livo2_XYZ_cov: %f, %f, %f", 
-             rtk_cov, livo2_RPY_cov, livo2_XYZ_cov);
              
     gtsam::noiseModel::Diagonal::shared_ptr priorNoise =
         gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6).finished());
     gtsam::noiseModel::Diagonal::shared_ptr odometryNoise = 
-        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << livo2_RPY_cov, livo2_RPY_cov, livo2_RPY_cov, livo2_XYZ_cov, livo2_XYZ_cov, livo2_XYZ_cov*9).finished());
+        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << livo2_RPY_cov, livo2_RPY_cov, livo2_RPY_cov, livo2_XYZ_cov, livo2_XYZ_cov, livo2_XYZ_cov*4.0).finished());
+    // Treat `rtk_cov` as RTK standard deviation (sigma) in meters.
+    // Square it to get variances for GTSAM noise model.
+    const double rtk_var = rtk_cov * rtk_cov;
     gtsam::noiseModel::Diagonal::shared_ptr gps_noise =
-        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(3) << rtk_cov, rtk_cov, rtk_cov*4).finished());
+        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(3) << rtk_var, rtk_var, rtk_var * 4.0).finished());
+    
+    ROS_INFO("rtk_var, livo2_RPY_cov, livo2_XYZ_cov: %f, %f, %f", rtk_var, livo2_RPY_cov, livo2_XYZ_cov);
 
     size_t rtk_idx = 0; 
 

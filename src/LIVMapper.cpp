@@ -125,7 +125,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   //nh.param<bool>("gps/gps_en", rtk_en, false);
   // 用 /localization/odom 当 RTK 观测：odom_rtk_en=true 时不再订阅 GNSS PVT，
   // 直接把该里程计的位置/速度塞进 rtk_buffer（rtk_en 随之打开，否则 sync_packages 不消费）
-  nh.param<bool>("gps/odom_rtk_en", odom_rtk_en_, false);
+  nh.param<bool>("gps/odom_rtk_en", odom_rtk_en_, true);
   nh.param<std::string>("gps/odom_rtk_topic", odom_rtk_topic_, "/localization/odom");
   if (odom_rtk_en_) rtk_en = true;
   // 断流恢复健壮性处理总开关，见 LIVMapper.h 里的注释；默认 false，行为与之前一致。
@@ -1376,7 +1376,14 @@ void LIVMapper::rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
 //   3) 时间戳直接用 header.stamp（同样减 1ms，与 rtk_cbk 对齐 sync_packages 的取帧区间）。
 void LIVMapper::localization_odom_cbk(const nav_msgs::Odometry::ConstPtr& odomMsg)
 {
-    ROS_INFO_THROTTLE(1.0, "RTK(odom) received (throttle 1s)");
+  // ROS_INFO("RTK(odom) received (throttle 1s). timestamp %.6f ", odomMsg->header.stamp.toSec());
+  // if (odomMsg->header.stamp.toSec() > (1785289545.0 + 30) and odomMsg->header.stamp.toSec() < (1785289545.0 + 60))
+  // {
+  //   ROS_ERROR("RTK(odom) NOT used: timestamp %.6f in [%.6f, %.6f]", odomMsg->header.stamp.toSec(),  1785289545.0 + 30, 1785289545.0 + 60);
+  //   return;
+  // }
+  // ROS_INFO("RTK(odom) received (throttle 1s). timestamp %.6f ", odomMsg->header.stamp.toSec());
+
     static bool first_odom = false;
     static Eigen::Vector3d odom_origin = Eigen::Vector3d::Zero();
 
@@ -1395,6 +1402,7 @@ void LIVMapper::localization_odom_cbk(const nav_msgs::Odometry::ConstPtr& odomMs
     }
 
     const Eigen::Vector3d trans_local_ = p_abs - odom_origin;
+    // ROS_INFO("[RTK(odom)] trans_local_ set to [%.3f, %.3f, %.3f]", trans_local_[0], trans_local_[1], trans_local_[2]);
 
     ros::Time stamp = odomMsg->header.stamp;
 

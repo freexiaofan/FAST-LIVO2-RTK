@@ -44,7 +44,7 @@ vio:
 
 imu:
   imu_en: true
-  imu_int_frame: 30
+  imu_int_frame: 10
   acc_cov: 0.2 # 0.2
   gyr_cov: 0.5 #0.5
   b_acc_cov: 0.0001 # 0.1
@@ -71,11 +71,11 @@ uav:
   gravity_align_en: false
 
 publish:
-  dense_map_en: true
+  dense_map_en: false
   pub_effect_point_en: false 
   pub_plane_en: false
-  pub_scan_num: 1
-  blind_rgb_points: 0.0
+  pub_scan_num: 2
+  blind_rgb_points: 1.0
 
 evo:
   seq_name: "Grass01"
@@ -101,7 +101,7 @@ gps:
   # RTK 位置观测的标准差 [x,y,z]，米。原来在 voxel_map.cpp 里硬编码成 [0.003,0.003,0.1]，
   # 对实测残差（xy 十几厘米、z 数米）过于乐观：位置被钉死后激光残差只能靠旋转去消，姿态被带跑。
   # z 给 1e3 = 实质关闭 z 观测（与 handleRTK 里 z_k[2]=state.z 的做法一致）。
-  rtk_std: [0.05, 0.05, 0.10]
+  rtk_std: [0.03, 0.03, 0.05]
   # 断流恢复健壮性处理总开关（默认关，行为与之前完全一致），详见 AGV-LVGO.yaml 里的注释。
   rtk_robust_recovery_en: false
   rtk_gap_thresh: 1.0     # 秒
@@ -117,11 +117,11 @@ opt:
   min_keyframes: 10
   # initialAlign 里 LIO->RTK 刚体对齐用多长的轨迹(秒)：<=0 = 用全部关键帧(推荐)。
   # 原来写死 50s，短轨迹对 6 自由度 SVD 是退化构型，俯仰会被拟出虚假倾角。
-  align_window: -1.0
+  align_window: 20.0
   # RTK 因子按行驶距离抽稀的间隔(米)：每走 10 m 加一个 GPSFactor；<=0 = 每个关键帧都加。
   # 关键帧按时间产生，等红灯时车不动也在攒帧，同一位置会堆几十个 RTK 因子把优化拽偏。
-  rtk_factor_interval: 5.0
-  rtk_cov: 0.05
+  rtk_factor_interval: 10.0
+  rtk_cov: 0.03
   livo2_RPY_cov: 0.00001
   livo2_XYZ_cov: 0.02
 
